@@ -601,6 +601,10 @@ li.pk-row.sel { background: var(--brand-t); }
 .rp-claim-note { flex: 1 1 200px; }
 .rp-claim .small { margin: 8px 0 0; }
 .rp-filters .mini[hidden] { display: none; }
+.rp-filters #rp-cust { min-width: 220px; }
+@media (max-width: 720px) { .rp-filters #rp-cust { min-height: 52px; } }
+.rp-tabs { display: flex; flex-wrap: wrap; gap: 6px; margin: 0 0 12px; }
+.rp-active { margin: 0 0 6px; color: var(--brand); font-weight: 600; }
 @media (max-width: 960px) {
   .rp-grid { grid-template-columns: minmax(0, 1fr); }
   .rp-nav { display: none; }
@@ -2967,24 +2971,25 @@ li.pk-row.sel { background: var(--brand-t); }
     return n;
   }
   function colLetter(n) { let s = ''; while (n > 0) { const m = (n - 1) % 26; s = String.fromCharCode(65 + m) + s; n = Math.floor((n - 1) / 26); } return s; }
-  function numFmt(t) { return t === 'int' ? '#,##0' : t === 'dec' ? '#,##0.0#' : t === 'pct' ? '0.0%' : t === 'date' ? 'dd-mmm-yyyy' : null; }
-  const isNum = function (t) { return t === 'int' || t === 'dec' || t === 'pct'; };
+  function numFmt(t) { return t === 'int' ? '#,##0' : t === 'dec' ? '#,##0.0#' : t === 'pct' ? '0.0%' : t === 'date' ? 'dd-mmm-yyyy' : t === 'dur' ? '[h]:mm' : null; }
+  const isNum = function (t) { return t === 'int' || t === 'dec' || t === 'pct' || t === 'dur'; };
 
   function cellValue(c, v) {
     if (v === null || v === undefined || v === '') return null;
     if (c.t === 'date') return dateValue(v) || String(v);
+    if (c.t === 'dur') return isNaN(parseFloat(v)) ? String(v) : parseFloat(v) / 1440;   // minutes -> Excel time, shown as hours:minutes
     if (isNum(c.t)) return typeof v === 'number' ? v : (isNaN(parseFloat(v)) ? String(v) : parseFloat(v));
     if (c.t === 'map') return { text: 'Open map', hyperlink: 'https://www.google.com/maps?q=' + encodeURIComponent(v) };
     return String(v);
   }
 
-  function addTitleBlock(ws, meta, title, ncols) {
+  function addTitleBlock(ws, meta, title, ncols, filters) {
     const last = Math.max(ncols, 4);
     ws.mergeCells(1, 1, 1, last); ws.mergeCells(2, 1, 2, last); ws.mergeCells(3, 1, 3, last);
     const a = ws.getCell(1, 1); a.value = meta.company; a.font = { name: 'Calibri', size: 15, bold: true, color: { argb: BRAND } };
     const b = ws.getCell(2, 1); b.value = title; b.font = { name: 'Calibri', size: 13, bold: true, color: { argb: INK } };
     const c = ws.getCell(3, 1);
-    c.value = 'Period: ' + longDate(meta.from) + ' to ' + longDate(meta.to) + '   |   ' + meta.who + '   |   Generated ' + longDate(String(meta.generatedAt).slice(0, 10)) + ' ' + String(meta.generatedAt).slice(11, 16) + ' by ' + meta.generatedBy;
+    c.value = 'Period: ' + longDate(meta.from) + ' to ' + longDate(meta.to) + '   |   ' + meta.who + '   |   Generated ' + longDate(String(meta.generatedAt).slice(0, 10)) + ' ' + String(meta.generatedAt).slice(11, 16) + ' by ' + meta.generatedBy + (filters && filters.length ? '   |   Filters: ' + filters.join(', ') : '');
     c.font = { name: 'Calibri', size: 10, color: { argb: MUTED } };
     ws.getRow(1).height = 22; ws.getRow(2).height = 19;
   }
@@ -2992,7 +2997,7 @@ li.pk-row.sel { background: var(--brand-t); }
   function addReportSheet(wb, rp, meta, used) {
     const ws = wb.addWorksheet(sheetName(rp.title, used), { properties: { tabColor: { argb: BRAND } } });
     const cols = rp.columns, n = cols.length, HEAD = 5;
-    addTitleBlock(ws, meta, rp.title, n);
+    addTitleBlock(ws, meta, rp.reportTitle ? rp.reportTitle + ' - ' + rp.title : rp.title, n, meta.filters);
     // header
     const hr = ws.getRow(HEAD);
     cols.forEach(function (c, i) {
@@ -3023,7 +3028,7 @@ li.pk-row.sel { background: var(--brand-t); }
           const col = raw === 'A' ? ['FFFDE7E5', 'FFB3261E'] : raw === 'P' ? ['FFE6F4EA', 'FF1E6B3A'] : raw === 'M' ? ['FFFFF3D6', 'FF8A5A00'] : raw === 'WO' ? ['FFEDEFF1', 'FF5B6B75'] : null;
           if (col) { cell.fill = { type: 'pattern', pattern: 'solid', fgColor: { argb: col[0] } }; cell.font = { name: 'Calibri', size: 11, bold: true, color: { argb: col[1] } }; }
         }
-        const len = c.t === 'date' ? 12 : c.t === 'map' ? 10 : String(raw == null ? '' : (c.t === 'pct' ? '100.0%' : raw)).length;
+        const len = c.t === 'date' ? 12 : c.t === 'dur' ? 8 : c.t === 'map' ? 10 : String(raw == null ? '' : (c.t === 'pct' ? '100.0%' : raw)).length;
         if (len > widths[i]) widths[i] = Math.min(matrix && i > 0 ? 6 : 50, len + 2);
       });
     });
@@ -3075,7 +3080,7 @@ li.pk-row.sel { background: var(--brand-t); }
 
   function fillContents(ws, data, names) {
     const meta = data.meta;
-    addTitleBlock(ws, meta, 'Sales reports', 4);
+    addTitleBlock(ws, meta, 'Sales reports', 4, meta.filters);
     const HEAD = 5;
     ['Sheet', 'What it shows', 'Rows'].forEach(function (h, i) {
       const c = ws.getRow(HEAD).getCell(i + 1);
@@ -3119,9 +3124,9 @@ li.pk-row.sel { background: var(--brand-t); }
     const X = await loadLib();
     const wb = new X.Workbook();
     wb.creator = data.meta.company; wb.created = new Date();
-    wb.title = data.reports.length === 1 ? data.reports[0].title : 'Sales reports';
+    wb.title = data.noContents ? data.reports[0].reportTitle : data.reports.length === 1 ? data.reports[0].title : 'Sales reports';
     const used = {}, nameList = [];
-    const cs = data.reports.length > 1 ? wb.addWorksheet('Contents', { properties: { tabColor: { argb: 'FFE07B00' } } }) : null;
+    const cs = (data.reports.length > 1 && !data.noContents) ? wb.addWorksheet('Contents', { properties: { tabColor: { argb: 'FFE07B00' } } }) : null;
     if (cs) used.contents = 1;
     data.reports.forEach(function (rp) { nameList.push(addReportSheet(wb, rp, data.meta, used)); });
     if (cs) fillContents(cs, data, nameList);
@@ -3155,7 +3160,10 @@ li.pk-row.sel { background: var(--brand-t); }
   SV.pages = SV.pages || {};
 
   const SHOW = 300;
-  const WRAP = { InAddress: 1, OutAddress: 1, Remarks: 1, Issues: 1, Note: 1 };
+  const WRAP = { InAddress: 1, OutAddress: 1, Remarks: 1, Issues: 1, Note: 1, Address: 1, Location: 1, Purpose: 1 };
+  const STATUSES = ['Completed', 'In progress', 'Planned', 'Missed', 'Cancelled'];
+  const BADGE = { 'Completed': 'b-active', 'In progress': 'b-planned', 'Planned': 'b-planned', 'Missed': 'b-flag', 'Cancelled': 'b-mute', 'No punch-in': 'b-flag' };
+  function dur(m) { m = Math.round(Number(m)); return m >= 60 ? Math.floor(m / 60) + ' h ' + pad(m % 60) + ' min' : m + ' min'; }
   const FLAGS = { 'Over-claimed': 1, 'No GPS trail': 1, 'Late': 1, 'Missed punch-out': 1, 'Never visited': 1, 'Not visited': 1, 'Checked in, never checked out': 1 };
 
   function pad(n) { return (n < 10 ? '0' : '') + n; }
@@ -3177,10 +3185,11 @@ li.pk-row.sel { background: var(--brand-t); }
     switch (c.t) {
       case 'int': return esc(Number(v).toLocaleString('en-IN'));
       case 'dec': return esc(Number(v).toLocaleString('en-IN', { maximumFractionDigits: 2 }));
+      case 'dur': return '<span class="nw">' + esc(dur(v)) + '</span>';
       case 'pct': return esc((Math.round(v * 1000) / 10) + '%');
       case 'date': return /^\d{4}-\d{2}-\d{2}$/.test(v) ? '<span class="nw">' + esc(SV.fmtDate(v)) + '</span>' : esc(v);
       case 'map': return '<a class="link" href="https://www.google.com/maps?q=' + encodeURIComponent(v) + '" target="_blank" rel="noopener">Open map</a>';
-      default: return FLAGS[v] ? '<span class="badge b-flag">' + esc(v) + '</span>' : (v === 'OK' ? '<span class="badge b-active">OK</span>' : esc(v));
+      default: return (c.k === 'Status' && BADGE[v]) ? '<span class="badge ' + BADGE[v] + '">' + esc(v) + '</span>' : FLAGS[v] ? '<span class="badge b-flag">' + esc(v) + '</span>' : (v === 'OK' ? '<span class="badge b-active">OK</span>' : esc(v));
     }
   }
 
@@ -3188,16 +3197,18 @@ li.pk-row.sel { background: var(--brand-t); }
     title: 'Reports',
     async render(root, q) {
       const admin = SV.isAdmin(), today = SV.today(), P = presets(today);
-      let cat, users = [];
+      let cat, users = [], custs = [];
       try {
         const calls = [SV.api('reportCatalog')];
+        calls.push(SV.customers().catch(function () { return { leads: [], accounts: [] }; }));
         if (admin) calls.push(SV.api('userList'));
         const r = await Promise.all(calls);
-        cat = r[0]; if (admin) users = r[1].users.filter(function (u) { return u.Role !== 'Admin'; });
+        cat = r[0]; custs = r[1].leads.map(function (l) { return { key: 'Lead|' + l.LeadID, label: l.Company + ' (Lead)' }; }).concat(r[1].accounts.map(function (a) { return { key: 'Account|' + a.AccountID, label: a.Company + ' (Account)' }; }));
+        if (admin) users = r[2].users.filter(function (u) { return u.Role !== 'Admin'; });
       } catch (e) { root.innerHTML = SV.empty({ icon: 'alert', title: 'Could not load reports', text: e.message }); return; }
 
       const byId = {}; cat.reports.forEach(function (r) { byId[r.id] = r; });
-      const st = { id: byId[q.r] ? q.r : 'scorecard', preset: 'month', from: P.month.from, to: P.month.to, owner: '', days: cat.defaults.days, minMin: cat.defaults.minMin, maxMin: cat.defaults.maxMin,
+      const st = { id: byId[q.r] ? q.r : 'visitSummary', sec: '', customer: '', status: '', preset: 'month', from: P.month.from, to: P.month.to, owner: '', days: cat.defaults.days, minMin: cat.defaults.minMin, maxMin: cat.defaults.maxMin,
         cur: null, meta: null, shown: SHOW, seq: 0, claimUser: '', claimDate: today };
       const groups = []; cat.reports.forEach(function (r) { let g = groups.find(function (x) { return x.name === r.group; }); if (!g) groups.push(g = { name: r.group, items: [] }); g.items.push(r); });
       const company = SV.state.settings.CompanyName;
@@ -3210,6 +3221,8 @@ li.pk-row.sel { background: var(--brand-t); }
         '<label class="mini">From<input class="input" type="date" id="rp-from" value="' + st.from + '" max="' + today + '"></label>' +
         '<label class="mini">To<input class="input" type="date" id="rp-to" value="' + st.to + '"></label>' +
         (admin ? '<label class="mini">Salesperson<select class="input" id="rp-owner"><option value="">All salespeople</option>' + users.map(function (u) { return '<option value="' + esc(u.UserID) + '">' + esc(u.FullName) + (u.Active ? '' : ' (inactive)') + '</option>'; }).join('') + '</select></label>' : '') +
+        '<label class="mini rp-p" data-p="customer" hidden>Customer<input class="input" type="text" id="rp-cust" list="rp-cust-list" placeholder="All customers" autocomplete="off"><datalist id="rp-cust-list">' + custs.map(function (c) { return '<option value="' + esc(c.label) + '">'; }).join('') + '</datalist></label>' +
+        '<label class="mini rp-p" data-p="status" hidden>Visit status<select class="input" id="rp-status"><option value="">All statuses</option>' + STATUSES.map(function (x) { return '<option>' + x + '</option>'; }).join('') + '</select></label>' +
         '<label class="mini rp-p" data-p="days" hidden>Not visited for (days)<input class="input" type="number" id="rp-days" min="1" max="365" value="' + st.days + '"></label>' +
         '<label class="mini rp-p" data-p="minMin" hidden>Short visit under (min)<input class="input" type="number" id="rp-min" min="1" max="120" value="' + st.minMin + '"></label>' +
         '<label class="mini rp-p" data-p="maxMin" hidden>Long visit over (min)<input class="input" type="number" id="rp-max" min="30" max="1440" value="' + st.maxMin + '"></label></div>' +
@@ -3232,12 +3245,14 @@ li.pk-row.sel { background: var(--brand-t); }
       const params = function () {
         const p = { from: st.from, to: st.to, days: st.days, minMin: st.minMin, maxMin: st.maxMin };
         if (admin && st.owner) p.userId = st.owner;
+        if (st.customer && byId[st.id].params.indexOf('customer') !== -1) p.customer = st.customer;
+        if (st.status && byId[st.id].params.indexOf('status') !== -1) p.status = st.status;
         return p;
       };
 
       const tableHtml = function (rp) {
         const cols = rp.columns.map(function (c, i) {
-          const num = c.t === 'int' || c.t === 'dec' || c.t === 'pct';
+          const num = c.t === 'int' || c.t === 'dec' || c.t === 'pct' || c.t === 'dur';
           return { label: esc(c.l), cls: (i === 0 ? 'col-main ' : '') + (num ? 'num' : '') + (WRAP[c.k] ? 'wrap' : ''), mobileLabel: i === 0 ? '' : c.l, render: function (r) { const v = ((r.__tot || (st.id === 'attSheet' && i > 0)) && (r[c.k] === undefined || r[c.k] === null || r[c.k] === '')) ? '' : fmt(c, r[c.k]); return i === 0 ? '<strong>' + v + '</strong>' : v; } };
         });
         const rows = rp.rows.slice(0, st.shown);
@@ -3246,7 +3261,7 @@ li.pk-row.sel { background: var(--brand-t); }
           if (t[k0] === undefined || t[k0] === null || t[k0] === '') t[k0] = 'Total';
           rows.push(t);
         }
-        return SV.table({ cols: cols, rows: rows, cls: 'compact rp-table' + (rp.id === 'attSheet' ? ' keep' : ''), rowAttrs: function (r) { return r.__tot ? 'class="tot"' : ''; } }) +
+        return SV.table({ cols: cols, rows: rows, cls: 'compact rp-table' + (st.id === 'attSheet' ? ' keep' : ''), rowAttrs: function (r) { return r.__tot ? 'class="tot"' : ''; } }) +
           (rp.rows.length > st.shown ? '<div class="more"><button class="btn btn-ghost" data-act="more">Show more (' + (rp.rows.length - st.shown) + ' hidden)</button></div>' : '');
       };
 
@@ -3268,15 +3283,18 @@ li.pk-row.sel { background: var(--brand-t); }
 
       const out = $('rp-out');
       const draw = function () {
-        const rp = st.cur, def = byId[st.id];
+        const rp = st.cur, def = byId[st.id], secs = rp.sections || null, sec = secs ? (secs.find(function (x) { return x.id === st.sec; }) || secs[0]) : rp, tab = secs ? sec.id : '';
+        if (secs) st.sec = sec.id;
         $('rp-sub').textContent = SV.fmtDate(st.from) + ' to ' + SV.fmtDate(st.to) + (st.meta ? ', ' + st.meta.who : '');
         out.innerHTML =
           '<div class="rp-head"><div><h2>' + esc(def.title) + '</h2><p class="muted">' + esc(def.description) + '</p></div>' +
           '<button class="btn btn-ghost" data-act="one" id="rp-one">' + icon('download') + 'Excel</button></div>' +
           (st.id === 'km' ? claimForm() : '') +
-          (rp.rows.length ? '<p class="small muted rp-count">' + rp.rows.length + (rp.rows.length === 1 ? ' row' : ' rows') + (rp.truncated ? ' shown of ' + rp.truncated : '') + '</p>' + tableHtml(rp) :
-            SV.empty({ icon: 'list', title: 'No data for this period', text: 'Widen the dates or choose another salesperson.' })) +
-          ((rp.notes && rp.notes.length) ? '<ul class="rp-notes">' + rp.notes.map(function (n) { return '<li>' + esc(n) + '</li>'; }).join('') + '</ul>' : '');
+          (secs ? '<div class="rp-tabs" role="tablist" aria-label="Report sections">' + secs.map(function (x) { return '<button type="button" role="tab" class="pk-tab' + (x.id === tab ? ' on' : '') + '" aria-selected="' + (x.id === tab) + '" data-act="sec" data-id="' + x.id + '">' + esc(x.title) + ' <span>' + x.rows.length + '</span></button>'; }).join('') + '</div>' : '') +
+          (st.meta && st.meta.filters && st.meta.filters.length ? '<p class="small rp-active">Filtered by ' + esc(st.meta.filters.join(', ')) + '</p>' : '') +
+          (sec.rows.length ? '<p class="small muted rp-count">' + sec.rows.length + (sec.rows.length === 1 ? ' row' : ' rows') + (sec.truncated ? ' shown of ' + sec.truncated : '') + '</p>' + tableHtml(sec) :
+            SV.empty({ icon: 'list', title: 'No data for these filters', text: 'Widen the dates or clear the salesperson, customer or status filter.' })) +
+          ((sec.notes && sec.notes.length) ? '<ul class="rp-notes">' + sec.notes.map(function (n) { return '<li>' + esc(n) + '</li>'; }).join('') + '</ul>' : '');
         if (st.id === 'km') prefillClaim();
       };
 
@@ -3312,6 +3330,14 @@ li.pk-row.sel { background: var(--brand-t); }
       const dateChanged = function () { st.preset = 'custom'; $('rp-preset').value = 'custom'; apply(); };
       $('rp-from').addEventListener('change', function (e) { if (e.target.value) { st.from = e.target.value; dateChanged(); } });
       $('rp-to').addEventListener('change', function (e) { if (e.target.value) { st.to = e.target.value; dateChanged(); } });
+      const cu = $('rp-cust');
+      cu.addEventListener('change', function () {
+        const v = cu.value.trim().toLowerCase(), hit = v ? custs.find(function (c) { return c.label.toLowerCase() === v; }) || custs.filter(function (c) { return c.label.toLowerCase().indexOf(v) !== -1; }).filter(function (c, i, a) { return a.length === 1; })[0] : null;
+        if (v && !hit) { SV.fail(new Error('Pick a customer from the list, or clear the box to see all customers.')); cu.value = ''; st.customer = ''; }
+        else { st.customer = hit ? hit.key : ''; if (hit) cu.value = hit.label; }
+        apply();
+      });
+      $('rp-status').addEventListener('change', function (e) { st.status = e.target.value; apply(); });
       const ow = $('rp-owner'); if (ow) ow.addEventListener('change', function () { st.owner = ow.value; apply(); });
       const num = function (id, key, lo, hi) {
         $(id).addEventListener('change', function (e) {
@@ -3323,7 +3349,7 @@ li.pk-row.sel { background: var(--brand-t); }
 
       const select = function (id) {
         if (!byId[id]) return;
-        st.id = id; history.replaceState(null, '', '#/reports?r=' + id); drawNav(); load();
+        st.id = id; st.sec = ''; history.replaceState(null, '', '#/reports?r=' + id); drawNav(); load();
       };
 
       out.addEventListener('submit', async function (e) {
@@ -3346,8 +3372,15 @@ li.pk-row.sel { background: var(--brand-t); }
 
       SV.bind(root, {
         pick: function (d) { select(d.id); },
+        sec: function (d) { st.sec = d.id; st.shown = SHOW; draw(); },
         more: function () { st.shown += SHOW; draw(); },
-        one: function (d, el) { if (st.cur) download(el, async function () { return { meta: st.meta, reports: [st.cur] }; }, slug(st.cur.title.replace(/[^A-Za-z0-9 ]/g, ' ')) || 'Report'); },
+        one: function (d, el) {
+          if (!st.cur) return;
+          const cur = st.cur, data = cur.sections
+            ? { meta: st.meta, noContents: true, reports: cur.sections.map(function (x) { return Object.assign({ id: cur.id + '.' + x.id, reportTitle: cur.title, group: cur.group, description: cur.description }, x); }) }
+            : { meta: st.meta, reports: [cur] };
+          download(el, async function () { return data; }, slug(cur.title.replace(/[^A-Za-z0-9 ]/g, ' ')) || 'Report');
+        },
         all: function (d, el) {
           download(el, async function () {
             const r = await SV.api('reportAll', params());
