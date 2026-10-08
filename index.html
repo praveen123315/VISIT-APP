@@ -343,6 +343,7 @@ button.mrow:hover { background: var(--paper); }
 .skeleton { background: var(--surface); border: 1px solid var(--line); border-radius: var(--r-l); padding: 6px 18px; }
 .sk-row { display: grid; grid-template-columns: 2fr 1fr 1fr; gap: 14px; padding: 16px 0; border-top: 1px solid var(--line-2); }
 .sk-row:first-child { border-top: 0; }
+.slow-hint { margin: 12px 2px 0; font-size: 14px; }
 .sk-row i { height: 12px; border-radius: 6px; background: linear-gradient(90deg, #e9edef 25%, #f4f6f7 50%, #e9edef 75%); background-size: 200% 100%; animation: shimmer 1.4s infinite; }
 @keyframes shimmer { to { background-position: -200% 0; } }
 
@@ -706,13 +707,49 @@ li.pk-row.sel { background: var(--brand-t); }
   // Actions that only read data are safe to repeat, so one slow or dropped reply is retried automatically.
   const READ_ONLY = /(List|Get)$|^(dashboard|todayVisits|visitHistory|attendanceToday|me|ping|reportCatalog|reportRun)$/;
 
+  // Every list the screens loop over. Whatever the server sends, these always arrive as real arrays, so a page can
+  // never fail with "Cannot read properties of undefined (reading 'filter')". A key that was missing or not a list is
+  // reported in data.__partial so a page can say so instead of quietly showing "nothing here".
+  const LISTS = {
+    leadList: ['leads'], accountList: ['accounts'], userList: ['users'], visitList: ['visits'], visitHistory: ['logs'],
+    attendanceList: ['rows'], todayVisits: ['today', 'overdue'], reportCatalog: ['reports']
+  };
+  function normalize(action, data) {
+    const keys = LISTS[action];
+    if (!keys) return data;
+    const out = (data && typeof data === 'object' && !Array.isArray(data)) ? data : {};
+    const bad = [];
+    keys.forEach(function (k) { if (!Array.isArray(out[k])) { bad.push(k); out[k] = []; } });
+    if (bad.length) {
+      try { console.warn('[SV] "' + action + '" reply was missing: ' + bad.join(', ')); } catch (e) { /* no console */ }
+      Object.defineProperty(out, '__partial', { value: bad, enumerable: false });
+    }
+    return out;
+  }
+
   /** SV.api('leadList', {…}) -> data. Throws ApiError with .code and a user-friendly message. */
   SV.api = async function (action, params, opts) {
-    try { return await call(action, params, opts); }
-    catch (e) {
-      if (e && e.code === 'NETWORK' && READ_ONLY.test(action)) return call(action, params, Object.assign({}, opts, { timeout: 90000 }));
-      throw e;
+    const write = !READ_ONLY.test(action);
+    let data;
+    try {
+      try { data = await call(action, params, opts); }
+      catch (e) {
+        if (e && e.code === 'NETWORK' && !write) data = await call(action, params, Object.assign({}, opts, { timeout: 90000 }));
+        else throw e;
+      }
+    } finally {
+      // Anything that may have changed data (even one that timed out half-way) empties the shared store,
+      // so no screen can show information from before the change.
+      if (write && SV.cacheClear) SV.cacheClear();
     }
+    return normalize(action, data);
+  };
+
+  /** Text that is safe to show a person: our own messages as they are, anything else (a code error) in plain words. */
+  SV.errText = function (e) {
+    if (e instanceof ApiError || (e && e.code && typeof e.message === 'string')) return e.message;
+    try { console.error(e); } catch (x) { /* no console */ }
+    return 'Something went wrong while showing this page. Try again.';
   };
 
   async function call(action, params, opts) {
@@ -755,22 +792,79 @@ li.pk-row.sel { background: var(--brand-t); }
     return body.data;
   }
 
-  /* small in-memory cache for lookup lists (customer pickers) */
-  const cache = {};
+  /* ---------------------------------------------------------------------------------------------
+   * Shared data store. A screen asks for data with SV.read():
+   *   - fresh data (younger than `fresh`)      -> returned straight away, no server call
+   *   - older data (younger than `max`)         -> returned straight away AND refreshed in the background
+   *   - nothing stored / too old                -> fetched, the screen waits
+   * The same request made twice at once is sent once. A failed or incomplete reply is never stored.
+   * Anything that changes data calls SV.cacheClear(), so the next read is always up to date.
+   * ------------------------------------------------------------------------------------------- */
+  const store = {}, cache = {};
+  let gen = 0;
+  const TTL = {                                  // [fresh, max] in milliseconds
+    leadList: [45000, 600000], accountList: [45000, 600000], userList: [60000, 600000],
+    dashboard: [0, 300000], todayVisits: [0, 300000]          // live screens: shown from memory at once, always re-checked
+  };
+  const keyOf = function (action, params) {
+    const u = SV.state && SV.state.user ? SV.state.user.UserID : '';
+    return u + '|' + action + '|' + JSON.stringify(params || {});
+  };
+  const noop = function () { /* a refresh that fails keeps what is on screen */ };
+
+  /** -> Promise<{ data, cached, refreshing }>; `refreshing` is a Promise of newer data, or null when nothing is being refreshed. */
+  SV.read = function (action, params, opts) {
+    const ttl = (opts && opts.ttl) || TTL[action] || [30000, 300000];
+    const k = keyOf(action, params);
+    const e = store[k] || (store[k] = { v: undefined, t: 0, p: null });
+    const age = e.t ? Date.now() - e.t : Infinity;
+    const start = function () {
+      if (!e.p) {
+        const g = gen;
+        e.p = SV.api(action, params).then(function (v) {
+          if (g === gen && !(v && v.__partial)) { e.v = v; e.t = Date.now(); }
+          return v;
+        }).finally(function () { if (store[k] === e) e.p = null; });
+        e.p.catch(noop);
+      }
+      return e.p;
+    };
+    if (opts && opts.force) return start().then(function (v) { return { data: v, cached: false, refreshing: null }; });
+    if (age < ttl[0]) return Promise.resolve({ data: e.v, cached: true, refreshing: null });
+    if (age < ttl[1]) return Promise.resolve({ data: e.v, cached: true, refreshing: start() });
+    return start().then(function (v) { return { data: v, cached: false, refreshing: null }; });
+  };
+
+  SV.cacheClear = function () { gen++; Object.keys(store).forEach(function (k) { delete store[k]; }); Object.keys(cache).forEach(function (k) { delete cache[k]; }); };
+
+  /** Warms the store so the next page opens instantly. Quiet: errors are ignored. */
+  SV.prefetch = function (names) {
+    (names || []).forEach(function (n, i) {
+      setTimeout(function () {
+        if (!SV.state || !SV.state.user || SV.state.user.MustChangePassword) return;   // nothing to warm before the first password is set
+        const a = n === 'users' ? 'userList' : n;
+        SV.read(a).catch(noop);
+      }, 400 + i * 350);
+    });
+  };
+
+  /** Salespeople as an array (admin screens). Never throws: an empty list just leaves the dropdown empty. */
+  SV.users = async function () {
+    try { return (await SV.read('userList')).data.users; } catch (e) { return []; }
+  };
+
+  SV.customers = async function () {
+    const r = await Promise.all([SV.read('leadList'), SV.read('accountList')]);
+    return { leads: r[0].data.leads, accounts: r[1].data.accounts };
+  };
+
+  /** Keeps SV.cached for any caller that still uses it. */
   SV.cached = async function (key, ttl, fn) {
     const hit = cache[key];
     if (hit && Date.now() - hit.t < ttl) return hit.v;
     const v = await fn();
     cache[key] = { t: Date.now(), v: v };
     return v;
-  };
-  SV.cacheClear = function () { Object.keys(cache).forEach(function (k) { delete cache[k]; }); };
-
-  SV.customers = function () {
-    return SV.cached('customers', 60000, async function () {
-      const r = await Promise.all([SV.api('leadList'), SV.api('accountList')]);
-      return { leads: r[0].leads, accounts: r[1].accounts };
-    });
   };
 })();
 </script>
@@ -1957,7 +2051,7 @@ li.pk-row.sel { background: var(--brand-t); }
     const S = SV.state.settings, admin = SV.isAdmin(), isLead = kind === 'Lead', editing = !!rec;
     rec = rec || {};
     let users = [];
-    if (admin) { try { users = (await SV.api('userList')).users.filter(function (u) { return u.Active; }); } catch (e) { SV.fail(e); return; } }
+    if (admin) users = (await SV.users()).filter(function (u) { return u.Active; });
     let loc = rec.Lat != null && rec.Lng != null ? { lat: rec.Lat, lng: rec.Lng } : null;
     let picker = null;
 
@@ -2120,23 +2214,36 @@ li.pk-row.sel { background: var(--brand-t); }
           '<div class="toolbar" id="pc-tools"></div>' +
           (admin ? '<div class="bulkbar" id="pc-bulk" hidden></div>' : '') +
           '<div id="pc-list">' + SV.skeleton(5) + '</div>';
-        let rows, users = [];
-        try {
-          const calls = [SV.api(isLead ? 'leadList' : 'accountList')];
-          if (admin) calls.push(SV.api('userList'));
-          const res = await Promise.all(calls);
-          rows = isLead ? res[0].leads : res[0].accounts;
-          if (admin) users = res[1].users.filter(function (u) { return u.Active; });
-        } catch (e) { root.querySelector('#pc-list').innerHTML = SV.empty({ icon: 'alert', title: 'Could not load ' + plural, text: e.message }); return; }
+        const listEl = root.querySelector('#pc-list');
+        const pick = function (d) { const a = d && (isLead ? d.leads : d.accounts); return Array.isArray(a) ? a : []; };
+        const usersP = admin ? SV.users() : Promise.resolve([]);   // never fails, and never holds the list back
+        let res;
+        try { res = await SV.read(isLead ? 'leadList' : 'accountList'); }
+        catch (e) {
+          listEl.innerHTML = SV.empty({ icon: 'alert', title: 'Could not load ' + plural, text: SV.errText(e), actionHtml: '<button class="btn btn-primary" data-act="retry">Try again</button>' });
+          SV.bind(root, { retry: function () { SV.route(); } });
+          return;
+        }
+        let rows = pick(res.data), users = [];
+        const partial = !!(res.data && res.data.__partial);
 
         const st = { q: '', status: '', city: '', owner: '', limit: 50, sel: new Set() };
         const statuses = isLead ? S.LeadStatuses : ['Active', 'Inactive'];
-        const cities = Array.from(new Set(rows.map(function (r) { return r.City; }).filter(Boolean))).sort();
+        const cityOptions = function () {
+          return '<option value="">All cities</option>' + Array.from(new Set(rows.map(function (r) { return r.City; }).filter(Boolean))).sort().map(function (s) { return '<option' + (s === st.city ? ' selected' : '') + '>' + esc(s) + '</option>'; }).join('');
+        };
+        const ownerOptions = function () {
+          return '<option value="">All salespeople</option><option value="__none"' + (st.owner === '__none' ? ' selected' : '') + '>Unassigned</option>' +
+            users.map(function (u) { return '<option value="' + esc(u.UserID) + '"' + (u.UserID === st.owner ? ' selected' : '') + '>' + esc(u.FullName) + '</option>'; }).join('');
+        };
         root.querySelector('#pc-tools').innerHTML =
           '<label class="search">' + icon('search') + '<input type="search" id="pc-q" placeholder="Search name, contact, mobile, city" aria-label="Search ' + plural + '"></label>' +
           '<select class="input" id="pc-status" aria-label="Filter by status"><option value="">All statuses</option>' + statuses.map(function (s) { return '<option>' + esc(s) + '</option>'; }).join('') + '</select>' +
-          '<select class="input" id="pc-city" aria-label="Filter by city"><option value="">All cities</option>' + cities.map(function (s) { return '<option>' + esc(s) + '</option>'; }).join('') + '</select>' +
-          (admin ? '<select class="input" id="pc-owner" aria-label="Filter by salesperson"><option value="">All salespeople</option><option value="__none">Unassigned</option>' + users.map(function (u) { return '<option value="' + esc(u.UserID) + '">' + esc(u.FullName) + '</option>'; }).join('') + '</select>' : '');
+          '<select class="input" id="pc-city" aria-label="Filter by city">' + cityOptions() + '</select>' +
+          (admin ? '<select class="input" id="pc-owner" aria-label="Filter by salesperson">' + ownerOptions() + '</select>' : '');
+        if (partial) {
+          listEl.insertAdjacentHTML('beforebegin', '<div class="notice" id="pc-partial">The server sent incomplete data, so this list may be missing records. <button class="link" data-act="retry">Reload</button></div>');
+        }
 
         const idOf = function (r) { return isLead ? r.LeadID : r.AccountID; };
         const filtered = function () {
@@ -2149,7 +2256,6 @@ li.pk-row.sel { background: var(--brand-t); }
             return (r.Company + ' ' + r.ContactPerson + ' ' + r.Mobile + ' ' + r.City + ' ' + r.Industry + ' ' + r.Email).toLowerCase().indexOf(q) !== -1;
           });
         };
-        const listEl = root.querySelector('#pc-list');
         const draw = function () {
           const f = filtered(), shown = f.slice(0, st.limit);
           root.querySelector('#pc-sub').textContent = f.length === rows.length ? rows.length + ' ' + plural : f.length + ' of ' + rows.length + ' ' + plural;
@@ -2191,6 +2297,24 @@ li.pk-row.sel { background: var(--brand-t); }
         const reload = function () { SV.route(); };
         draw();
 
+        usersP.then(function (list) {                       // the salesperson dropdowns fill in when the team list arrives
+          if (!root.isConnected) return;
+          users = list.filter(function (u) { return u.Active; });
+          const o = root.querySelector('#pc-owner'); if (o) o.innerHTML = ownerOptions();
+          if (st.sel.size) drawBulk();
+        });
+        if (res.refreshing) res.refreshing.then(function (d) {   // shown from memory first, then quietly brought up to date
+          if (!root.isConnected || !d || d.__partial) return;
+          const next = pick(d);
+          if (JSON.stringify(next) === JSON.stringify(rows)) return;
+          rows = next;
+          const ids = new Set(rows.map(idOf));
+          Array.from(st.sel).forEach(function (id) { if (!ids.has(id)) st.sel.delete(id); });
+          if (st.city && !rows.some(function (r) { return r.City === st.city; })) st.city = '';
+          const c = root.querySelector('#pc-city'); if (c) c.innerHTML = cityOptions();
+          draw(); drawBulk();
+        }).catch(function () { /* keep what is on screen */ });
+
         root.querySelector('#pc-q').addEventListener('input', SV.debounce(function (e) { st.q = e.target.value.trim(); st.limit = 50; draw(); }, 120));
         ['status', 'city', 'owner'].forEach(function (k) {
           const el = root.querySelector('#pc-' + k);
@@ -2207,6 +2331,7 @@ li.pk-row.sel { background: var(--brand-t); }
           }
         });
         const actions = {
+          retry: function () { SV.route(); },
           add: function () { openForm(kind, null, reload); },
           open: function (d) { SV.customerDetail(kind, d.id, reload); },
           plan: function (d) { SV.go('plan', isLead ? { lead: d.id } : { account: d.id }); },
@@ -2315,11 +2440,13 @@ li.pk-row.sel { background: var(--brand-t); }
 
       let cust, users = [];
       try {
-        const calls = [SV.customers()];
-        if (admin) calls.push(SV.api('userList'));
-        const r = await Promise.all(calls);
-        cust = r[0]; if (admin) users = r[1].users;
-      } catch (e) { root.querySelector('#vp-list').innerHTML = SV.empty({ icon: 'alert', title: 'Could not load', text: e.message }); return; }
+        const r = await Promise.all([SV.customers(), admin ? SV.users() : []]);
+        cust = r[0]; users = r[1];
+      } catch (e) {
+        root.querySelector('#vp-list').innerHTML = SV.empty({ icon: 'alert', title: 'Could not load', text: SV.errText(e), actionHtml: '<button class="btn btn-primary" data-act="retry">Try again</button>' });
+        SV.bind(root, { retry: function () { SV.route(); } });
+        return;
+      }
 
       const items = cust.leads.map(function (r) { return { type: 'Lead', id: r.LeadID, name: r.Company, contact: r.ContactPerson, city: r.City, owner: r.AssignedToName, assigned: r.AssignedTo, lat: r.Lat, lng: r.Lng, addr: r.Address }; })
         .concat(cust.accounts.map(function (r) { return { type: 'Account', id: r.AccountID, name: r.Company, contact: r.ContactPerson, city: r.City, owner: r.AssignedToName, assigned: r.AssignedTo, lat: r.Lat, lng: r.Lng, addr: r.Address }; }))
@@ -2498,14 +2625,17 @@ li.pk-row.sel { background: var(--brand-t); }
         '<select class="input" id="vp-scope" aria-label="Show"><option value="upcoming">Upcoming</option><option value="Completed">Completed</option><option value="Cancelled">Cancelled</option><option value="all">All (last 30 days on)</option></select>' +
         (admin ? '<select class="input" id="vp-owner" aria-label="Salesperson"><option value="">All salespeople</option>' + users.map(function (u) { return '<option value="' + esc(u.UserID) + '">' + esc(u.FullName) + '</option>'; }).join('') + '</select>' : '');
       const listEl = root.querySelector('#vp-list'), ovEl = root.querySelector('#vp-overview');
+      let lseq = 0;
       const loadList = async function () {
+        const my = ++lseq;
         listEl.innerHTML = SV.skeleton(3);
         const p = {};
         if (st.scope === 'upcoming') p.scope = 'upcoming'; else { if (st.scope !== 'all') p.status = st.scope; p.from = SV.addDays(today, -30); }
         if (admin && st.owner) p.assignedTo = st.owner;
         if (st.q) p.q = st.q;
         let visits;
-        try { visits = (await SV.api('visitList', p)).visits; } catch (er) { listEl.innerHTML = SV.empty({ icon: 'alert', title: 'Could not load visits', text: er.message }); return; }
+        try { visits = (await SV.api('visitList', p)).visits; } catch (er) { if (my !== lseq || !root.isConnected) return; listEl.innerHTML = SV.empty({ icon: 'alert', title: 'Could not load visits', text: SV.errText(er), actionHtml: '<button class="btn btn-primary" data-act="retry-list">Try again</button>' }); return; }
+        if (my !== lseq || !root.isConnected) return;
         root.querySelector('#vp-sub').textContent = visits.length + (visits.length === 1 ? ' visit' : ' visits');
         if (!visits.length) {
           ovEl.hidden = true;
@@ -2524,7 +2654,7 @@ li.pk-row.sel { background: var(--brand-t); }
       root.querySelector('#vp-q').addEventListener('input', SV.debounce(function (e) { st.q = e.target.value.trim(); loadList(); }, 250));
       root.querySelector('#vp-scope').addEventListener('change', function (e) { st.scope = e.target.value; loadList(); });
       const ow = root.querySelector('#vp-owner'); if (ow) ow.addEventListener('change', function () { st.owner = ow.value; loadList(); });
-      SV.bind(root, SV.visits.handlers(function () { SV.cacheClear(); loadList(); }));
+      SV.bind(root, Object.assign(SV.visits.handlers(function () { SV.cacheClear(); loadList(); }), { 'retry-list': function () { loadList(); } }));
       SV.visits.tick(root);
       loadList();
     }
@@ -2545,16 +2675,16 @@ li.pk-row.sel { background: var(--brand-t); }
         '<div id="td-body">' + SV.skeleton(4) + '</div>';
       const st = { me: null, owner: '', data: null };
       if (admin) {
-        try {
-          const u = (await SV.api('userList')).users.filter(function (x) { return x.Active; });
-          root.querySelector('#td-owner').insertAdjacentHTML('beforeend', u.map(function (x) { return '<option value="' + esc(x.UserID) + '">' + esc(x.FullName) + '</option>'; }).join(''));
-        } catch (e) { /* filter just stays empty */ }
+        SV.users().then(function (list) {          // fills in when the team list arrives; the visits do not wait for it
+          const sel = root.querySelector('#td-owner'); if (!sel || !root.isConnected) return;
+          sel.insertAdjacentHTML('beforeend', list.filter(function (x) { return x.Active; }).map(function (x) { return '<option value="' + esc(x.UserID) + '"' + (x.UserID === st.owner ? ' selected' : '') + '>' + esc(x.FullName) + '</option>'; }).join(''));
+        });
         root.querySelector('#td-owner').addEventListener('change', function (e) { st.owner = e.target.value; load(); });
       }
       const body = root.querySelector('#td-body');
 
       const draw = function () {
-        const d = st.data;
+        const d = st.data; d.date = d.date || SV.today();
         const open = d.today.filter(function (v) { return v.Status === 'Planned' || v.Status === 'Checked In'; }).length;
         const done = d.today.filter(function (v) { return v.Status === 'Completed'; }).length;
         root.querySelector('#td-sub').textContent = SV.fmtWeekday(d.date) + ', ' + d.today.length + (d.today.length === 1 ? ' visit' : ' visits') + (d.today.length ? ', ' + done + ' done, ' + open + ' to go' : '');
@@ -2573,12 +2703,24 @@ li.pk-row.sel { background: var(--brand-t); }
         else body.querySelector('#td-map').innerHTML = '<div class="map-fallback"><p class="muted">No customer locations to show</p></div>';
         SV.visits.tick(body);
       };
-      const load = async function () {
-        try { st.data = await SV.api('todayVisits', st.owner ? { assignedTo: st.owner } : {}); draw(); }
-        catch (e) { body.innerHTML = SV.empty({ icon: 'alert', title: 'Could not load visits', text: e.message }); }
+      let seq = 0;
+      const load = async function (force) {
+        const my = ++seq;
+        try {
+          const r = await SV.read('todayVisits', st.owner ? { assignedTo: st.owner } : {}, force === true ? { force: true } : undefined);
+          if (my !== seq || !root.isConnected) return;
+          st.data = r.data; draw();
+          if (r.refreshing) r.refreshing.then(function (d) {      // shown at once from memory, then brought up to date
+            if (my !== seq || !root.isConnected || !d || d.__partial) return;
+            if (JSON.stringify(d) !== JSON.stringify(st.data)) { st.data = d; draw(); }
+          }).catch(function () { /* keep what is on screen */ });
+        } catch (e) {
+          if (my !== seq || !root.isConnected) return;
+          body.innerHTML = SV.empty({ icon: 'alert', title: 'Could not load visits', text: SV.errText(e), actionHtml: '<button class="btn btn-primary" data-act="refresh">Try again</button>' });
+        }
       };
       SV.bind(root, Object.assign(SV.visits.handlers(function () { SV.cacheClear(); load(); }), {
-        refresh: function () { load(); },
+        refresh: function () { load(true); },
         plan: function () { SV.go('plan'); },
         locate: async function (d, btn) {
           SV.busy(btn, true, 'Locating');
@@ -2639,10 +2781,10 @@ li.pk-row.sel { background: var(--brand-t); }
         '<div id="vh-list">' + SV.skeleton(5) + '</div>';
 
       if (admin) {
-        try {
-          const u = (await SV.api('userList')).users;
-          root.querySelector('#vh-owner').insertAdjacentHTML('beforeend', u.map(function (x) { return '<option value="' + esc(x.UserID) + '">' + esc(x.FullName) + (x.Active ? '' : ' (inactive)') + '</option>'; }).join(''));
-        } catch (e) { /* ignore */ }
+        SV.users().then(function (u) {
+          const sel = root.querySelector('#vh-owner'); if (!sel || !root.isConnected) return;
+          sel.insertAdjacentHTML('beforeend', u.map(function (x) { return '<option value="' + esc(x.UserID) + '"' + (x.UserID === st.owner ? ' selected' : '') + '>' + esc(x.FullName) + (x.Active ? '' : ' (inactive)') + '</option>'; }).join(''));
+        });
       }
       const listEl = root.querySelector('#vh-list'), mapEl = root.querySelector('#vh-map');
 
@@ -2679,15 +2821,17 @@ li.pk-row.sel { background: var(--brand-t); }
       };
       function fig(v, label, cls) { return '<div class="fig ' + (cls || '') + '"><b>' + esc(v) + '</b><span>' + esc(label) + '</span></div>'; }
 
+      let hseq = 0;
       const load = async function () {
+        const my = ++hseq;
         listEl.innerHTML = SV.skeleton(4);
         const p = { from: st.from, to: st.to };
         if (admin && st.owner) p.assignedTo = st.owner;
         if (st.status) p.status = st.status;
         if (st.flagged) p.flag = 'FAR';
         if (st.q) p.q = st.q;
-        try { st.logs = (await SV.api('visitHistory', p)).logs; st.limit = 50; draw(); }
-        catch (e) { listEl.innerHTML = SV.empty({ icon: 'alert', title: 'Could not load history', text: e.message }); }
+        try { const r = await SV.api('visitHistory', p); if (my !== hseq || !root.isConnected) return; st.logs = r.logs; st.limit = 50; draw(); }
+        catch (e) { if (my !== hseq || !root.isConnected) return; listEl.innerHTML = SV.empty({ icon: 'alert', title: 'Could not load history', text: SV.errText(e), actionHtml: '<button class="btn btn-primary" data-act="retry-history">Try again</button>' }); }
       };
       const apply = SV.debounce(load, 250);
       root.querySelector('#vh-from').addEventListener('change', function (e) { if (e.target.value) { st.from = e.target.value; apply(); } });
@@ -2697,6 +2841,7 @@ li.pk-row.sel { background: var(--brand-t); }
       root.querySelector('#vh-flag').addEventListener('change', function (e) { st.flagged = e.target.checked; apply(); });
       root.querySelector('#vh-q').addEventListener('input', function (e) { st.q = e.target.value.trim(); apply(); });
       SV.bind(root, {
+        'retry-history': function () { load(); },
         open: function (d) { const l = st.logs.find(function (x) { return x.LogID === d.id; }); if (l) logDetail(l); },
         more: function () { st.limit += 50; draw(); },
         'toggle-map': function (d, btn) { st.showMap = !st.showMap; btn.innerHTML = icon('pin') + (st.showMap ? 'Hide map' : 'Show map'); draw(); },
@@ -2876,10 +3021,10 @@ li.pk-row.sel { background: var(--brand-t); }
         '<div id="at-list">' + SV.skeleton(5) + '</div>';
 
       if (admin) {
-        try {
-          const u = (await SV.api('userList')).users.filter(function (x) { return x.Role !== 'Admin'; });
-          root.querySelector('#at-owner').insertAdjacentHTML('beforeend', u.map(function (x) { return '<option value="' + esc(x.UserID) + '">' + esc(x.FullName) + (x.Active ? '' : ' (inactive)') + '</option>'; }).join(''));
-        } catch (e) { /* ignore */ }
+        SV.users().then(function (list) {
+          const sel = root.querySelector('#at-owner'); if (!sel || !root.isConnected) return;
+          sel.insertAdjacentHTML('beforeend', list.filter(function (x) { return x.Role !== 'Admin'; }).map(function (x) { return '<option value="' + esc(x.UserID) + '"' + (x.UserID === st.owner ? ' selected' : '') + '>' + esc(x.FullName) + (x.Active ? '' : ' (inactive)') + '</option>'; }).join(''));
+        });
       }
       const listEl = root.querySelector('#at-list');
       const fig = function (v, label, cls) { return '<div class="fig ' + (cls || '') + '"><b>' + esc(v) + '</b><span>' + esc(label) + '</span></div>'; };
@@ -3202,13 +3347,18 @@ li.pk-row.sel { background: var(--brand-t); }
       const admin = SV.isAdmin(), today = SV.today(), P = presets(today);
       let cat, users = [], custs = [];
       try {
-        const calls = [SV.api('reportCatalog')];
-        calls.push(SV.customers().catch(function () { return { leads: [], accounts: [] }; }));
-        if (admin) calls.push(SV.api('userList'));
-        const r = await Promise.all(calls);
+        const r = await Promise.all([
+          SV.api('reportCatalog'),
+          SV.customers().catch(function () { return { leads: [], accounts: [] }; }),
+          admin ? SV.users() : []
+        ]);
         cat = r[0]; custs = r[1].leads.map(function (l) { return { key: 'Lead|' + l.LeadID, label: l.Company + ' (Lead)' }; }).concat(r[1].accounts.map(function (a) { return { key: 'Account|' + a.AccountID, label: a.Company + ' (Account)' }; }));
-        if (admin) users = r[2].users.filter(function (u) { return u.Role !== 'Admin'; });
-      } catch (e) { root.innerHTML = SV.empty({ icon: 'alert', title: 'Could not load reports', text: e.message }); return; }
+        users = r[2].filter(function (u) { return u.Role !== 'Admin'; });
+      } catch (e) {
+        root.innerHTML = SV.empty({ icon: 'alert', title: 'Could not load reports', text: SV.errText(e), actionHtml: '<button class="btn btn-primary" data-act="retry">Try again</button>' });
+        SV.bind(root, { retry: function () { SV.route(); } });
+        return;
+      }
 
       const byId = {}; cat.reports.forEach(function (r) { byId[r.id] = r; });
       const st = { id: byId[q.r] ? q.r : 'visitSummary', sec: '', customer: '', status: '', preset: 'month', from: P.month.from, to: P.month.to, owner: '',
@@ -3376,6 +3526,18 @@ li.pk-row.sel { background: var(--brand-t); }
       (link ? '<button class="link small" data-go="' + link + '">' + esc(linkLabel) + '</button>' : '') + '</div>' + inner + '</section>';
   }
 
+  /** The dashboard reply with every list and counter present, so a thin or partial reply cannot break the page. */
+  function safe(d) {
+    d = d && typeof d === 'object' ? d : {};
+    const arr = function (k) { return Array.isArray(d[k]) ? d[k] : []; };
+    return Object.assign({}, d, {
+      counts: Object.assign({ todayTotal: 0, todayCompleted: 0, pending: 0, upcoming: 0, completedMonth: 0, leads: 0, accounts: 0 }, d.counts),
+      unassigned: Object.assign({ leads: 0, accounts: 0 }, d.unassigned),
+      todayVisits: arr('todayVisits'), pendingVisits: arr('pendingVisits'), upcoming: arr('upcoming'), recent: arr('recent'),
+      team: arr('team'), todayCheckins: arr('todayCheckins')
+    });
+  }
+
   SV.pages.dashboard = {
     title: 'Dashboard',
     async render(root) {
@@ -3383,80 +3545,91 @@ li.pk-row.sel { background: var(--brand-t); }
       root.innerHTML = '<div class="page-head"><div><h1>' + esc(greeting() + ', ' + me.FullName.split(' ')[0]) + '</h1><p class="page-sub">' + esc(SV.fmtWeekday(SV.today())) + (admin ? ', team overview' : '') + '</p></div>' +
         '<div class="head-actions"><button class="btn btn-ghost" data-go="plan">' + icon('calendar') + 'Plan visit</button>' +
         '<button class="btn btn-primary" data-act="add-lead">' + icon('plus') + 'Add lead</button></div></div><div id="db-body">' + SV.skeleton(5) + '</div>';
-      let d;
-      try { d = await SV.api('dashboard'); } catch (e) { root.querySelector('#db-body').innerHTML = SV.empty({ icon: 'alert', title: 'Could not load the dashboard', text: e.message }); return; }
-      const c = d.counts, body = root.querySelector('#db-body');
+      const body = root.querySelector('#db-body');
       const reload = function () { SV.cacheClear(); SV.route(); };
+      const paint = function (raw) {
+        const d = safe(raw), c = d.counts;
+        let html = '';
+        if (d.active) {
+          SV.visits.remember(d.active);
+          const l = d.active.Log || {};
+          html += '<section class="banner" aria-label="Active visit"><div class="banner-main"><span class="pulse" aria-hidden="true"></span><div><strong>Checked in at ' + esc(d.active.Customer.Name) + '</strong>' +
+            '<p>On site <b data-since="' + esc(l.CheckInTime) + '"></b> ' + SV.flagChip(l.CheckInFlag, l.CheckInDistanceM) + '</p></div></div>' +
+            '<div class="banner-actions"><button class="btn btn-signal" data-act="checkout" data-id="' + esc(d.active.VisitID) + '">' + icon('check') + 'Check out</button></div></section>';
+        }
+        if (d.attendance) html += SV.attendance.panel(d.attendance);
+        html += '<section class="panel dayline"><div class="panel-head"><h2 class="panel-h">' + (admin ? 'Team visits today' : 'Your day') + '</h2><span class="muted">' +
+          (c.todayTotal ? c.todayCompleted + ' of ' + c.todayTotal + ' done' : 'Nothing planned yet') + '</span></div>' + SV.visits.dayBar(d.todayVisits) +
+          (c.todayTotal ? '' : '<p class="muted small">Plan a visit and it will appear here.</p>') + '</section>';
+        html += '<div class="ledger">' + fig(c.todayTotal, 'Today', 'today') + fig(c.pending, 'Pending', 'today', c.pending ? 'warn' : '') + fig(c.upcoming, 'Upcoming', 'plan') +
+          fig(c.completedMonth, 'Completed this month', 'history') + fig(c.leads, 'Leads', 'leads') + fig(c.accounts, 'Accounts', 'accounts') + '</div>';
 
-      let html = '';
-      if (d.active) {
-        SV.visits.remember(d.active);
-        const l = d.active.Log || {};
-        html += '<section class="banner" aria-label="Active visit"><div class="banner-main"><span class="pulse" aria-hidden="true"></span><div><strong>Checked in at ' + esc(d.active.Customer.Name) + '</strong>' +
-          '<p>On site <b data-since="' + esc(l.CheckInTime) + '"></b> ' + SV.flagChip(l.CheckInFlag, l.CheckInDistanceM) + '</p></div></div>' +
-          '<div class="banner-actions"><button class="btn btn-signal" data-act="checkout" data-id="' + esc(d.active.VisitID) + '">' + icon('check') + 'Check out</button></div></section>';
-      }
-      if (d.attendance) html += SV.attendance.panel(d.attendance);
-      html += '<section class="panel dayline"><div class="panel-head"><h2 class="panel-h">' + (admin ? 'Team visits today' : 'Your day') + '</h2><span class="muted">' +
-        (c.todayTotal ? c.todayCompleted + ' of ' + c.todayTotal + ' done' : 'Nothing planned yet') + '</span></div>' + SV.visits.dayBar(d.todayVisits) +
-        (c.todayTotal ? '' : '<p class="muted small">Plan a visit and it will appear here.</p>') + '</section>';
-      html += '<div class="ledger">' + fig(c.todayTotal, 'Today', 'today') + fig(c.pending, 'Pending', 'today', c.pending ? 'warn' : '') + fig(c.upcoming, 'Upcoming', 'plan') +
-        fig(c.completedMonth, 'Completed this month', 'history') + fig(c.leads, 'Leads', 'leads') + fig(c.accounts, 'Accounts', 'accounts') + '</div>';
+        if (admin && (d.unassigned.leads || d.unassigned.accounts)) {
+          html += '<div class="callout">' + icon('alert') + '<span>' + (d.unassigned.leads ? d.unassigned.leads + ' lead' + (d.unassigned.leads > 1 ? 's' : '') : '') +
+            (d.unassigned.leads && d.unassigned.accounts ? ' and ' : '') + (d.unassigned.accounts ? d.unassigned.accounts + ' account' + (d.unassigned.accounts > 1 ? 's' : '') : '') +
+            ((d.unassigned.leads + d.unassigned.accounts) > 1 ? ' have' : ' has') + ' no salesperson. Visits cannot be planned until you assign an owner.</span><button class="btn btn-ghost btn-sm" data-go="' + (d.unassigned.leads ? 'leads' : 'accounts') + '">Assign now</button></div>';
+        }
 
-      if (admin && (d.unassigned.leads || d.unassigned.accounts)) {
-        html += '<div class="callout">' + icon('alert') + '<span>' + (d.unassigned.leads ? d.unassigned.leads + ' lead' + (d.unassigned.leads > 1 ? 's' : '') : '') +
-          (d.unassigned.leads && d.unassigned.accounts ? ' and ' : '') + (d.unassigned.accounts ? d.unassigned.accounts + ' account' + (d.unassigned.accounts > 1 ? 's' : '') : '') +
-          ((d.unassigned.leads + d.unassigned.accounts) > 1 ? ' have' : ' has') + ' no salesperson. Visits cannot be planned until you assign an owner.</span><button class="btn btn-ghost btn-sm" data-go="' + (d.unassigned.leads ? 'leads' : 'accounts') + '">Assign now</button></div>';
-      }
+        html += '<div class="dash-grid">';
+        html += panel(admin ? 'Today across the team' : "Today's visits", 'today', "Open today's visits",
+          d.todayVisits.length ? '<ul class="mlist">' + d.todayVisits.map(function (v) { return mrow(v, admin); }).join('') + '</ul>' : '<p class="muted pad">No visits planned for today.</p>');
+        if (d.pendingVisits.length) {
+          html += panel('Overdue', 'today', 'Open', '<ul class="mlist">' + d.pendingVisits.map(function (v) { return mrow(v, admin); }).join('') + '</ul>');
+        }
+        html += panel('Upcoming', 'plan', 'Visit plan', d.upcoming.length ? '<ul class="mlist">' + d.upcoming.map(function (v) { return mrow(v, admin); }).join('') + '</ul>' : '<p class="muted pad">No upcoming visits.</p>');
+        html += panel('Recently completed', 'history', 'History', d.recent.length
+          ? '<ul class="mlist">' + d.recent.map(function (l) {
+            return '<li><div class="mrow static"><span class="mt"><small>' + esc(SV.fmtDateShort(SV.isoDate(l.CheckOutTime))) + '</small>' + esc(SV.fmtTime(l.CheckOutTime)) + '</span><span class="mn"><strong>' + esc(l.CustomerName) + '</strong><small>' + esc(l.Outcome || '') + (admin ? ', ' + esc(l.UserName) : '') + '</small></span><span class="mr">' + esc(SV.fmtDuration(l.DurationMin)) + '</span></div></li>';
+          }).join('') + '</ul>' : '<p class="muted pad">Completed visits show up here.</p>');
+        html += '</div>';
 
-      html += '<div class="dash-grid">';
-      html += panel(admin ? 'Today across the team' : "Today's visits", 'today', "Open today's visits",
-        d.todayVisits.length ? '<ul class="mlist">' + d.todayVisits.map(function (v) { return mrow(v, admin); }).join('') + '</ul>' : '<p class="muted pad">No visits planned for today.</p>');
-      if (d.pendingVisits.length) {
-        html += panel('Overdue', 'today', 'Open', '<ul class="mlist">' + d.pendingVisits.map(function (v) { return mrow(v, admin); }).join('') + '</ul>');
+        if (admin) {
+          html += '<section class="panel"><div class="panel-head"><h2 class="panel-h">Salespeople today</h2></div>' + SV.table({
+            cols: [
+              { label: 'Salesperson', mobileLabel: '', cls: 'col-main', render: function (x) { return '<strong>' + esc(x.FullName) + '</strong>' + (x.checkedInAt ? '<span class="sub live">On site at ' + esc(x.checkedInAt) + '</span>' : ''); } },
+              { label: 'Attendance', render: function (x) {
+                const a = x.attendance;
+                if (x.Role === 'Admin') return '—';
+                if (!a) return '<span class="badge b-mute">Not punched in</span>';
+                return esc(SV.fmtTime(a.PunchInTime)) + ' to ' + (a.PunchOutTime ? esc(SV.fmtTime(a.PunchOutTime)) : '<span class="badge b-active">On duty</span>');
+              } },
+              { label: 'Planned', render: function (x) { return x.plannedToday; } },
+              { label: 'Completed', render: function (x) { return x.completedToday; } },
+              { label: 'Flagged far', render: function (x) { return x.flaggedToday ? '<span class="num-flag">' + x.flaggedToday + '</span>' : 0; } },
+              { label: 'Leads', render: function (x) { return x.leads; } },
+              { label: 'Accounts', render: function (x) { return x.accounts; } },
+              { label: 'Last login', render: function (x) { return x.LastLogin ? esc(SV.fmtDateTime(x.LastLogin)) : 'Never'; } }
+            ], rows: d.team, cls: 'compact'
+          }) + '</section>';
+          html += '<section class="panel"><div class="panel-head"><h2 class="panel-h">Check-ins today</h2><span class="muted small">' + d.todayCheckins.length + ' recorded</span></div><div id="db-map" class="map-box map-box-md"></div></section>';
+        }
+        body.innerHTML = html;
+        if (admin) {
+          const mk = d.todayCheckins.filter(function (l) { return l.CheckInLat != null; }).map(function (l) {
+            const cl = SV.flagColor(l.CheckInFlag);
+            return { lat: l.CheckInLat, lng: l.CheckInLng, title: l.CustomerName, color: SV.maps.COLORS[cl], info: '<div class="iw"><strong>' + esc(l.CustomerName) + '</strong><br>' + esc(l.UserName) + ', ' + esc(SV.fmtTime(l.CheckInTime)) + '<br>' + esc(SV.fmtDistance(l.CheckInDistanceM)) + ' from customer</div>' };
+          });
+          const m = body.querySelector('#db-map');
+          if (mk.length) SV.maps.show(m, { markers: mk }); else m.innerHTML = '<div class="map-fallback"><p class="muted">No check-ins yet today</p></div>';
+        }
+        SV.visits.tick(body);
+      };
+      let res;
+      try { res = await SV.read('dashboard'); }
+      catch (e) {
+        body.innerHTML = SV.empty({ icon: 'alert', title: 'Could not load the dashboard', text: SV.errText(e), actionHtml: '<button class="btn btn-primary" data-act="retry">Try again</button>' });
+        SV.bind(root, { retry: function () { SV.route(); } });
+        return;
       }
-      html += panel('Upcoming', 'plan', 'Visit plan', d.upcoming.length ? '<ul class="mlist">' + d.upcoming.map(function (v) { return mrow(v, admin); }).join('') + '</ul>' : '<p class="muted pad">No upcoming visits.</p>');
-      html += panel('Recently completed', 'history', 'History', d.recent.length
-        ? '<ul class="mlist">' + d.recent.map(function (l) {
-          return '<li><div class="mrow static"><span class="mt"><small>' + esc(SV.fmtDateShort(SV.isoDate(l.CheckOutTime))) + '</small>' + esc(SV.fmtTime(l.CheckOutTime)) + '</span><span class="mn"><strong>' + esc(l.CustomerName) + '</strong><small>' + esc(l.Outcome || '') + (admin ? ', ' + esc(l.UserName) : '') + '</small></span><span class="mr">' + esc(SV.fmtDuration(l.DurationMin)) + '</span></div></li>';
-        }).join('') + '</ul>' : '<p class="muted pad">Completed visits show up here.</p>');
-      html += '</div>';
-
-      if (admin) {
-        html += '<section class="panel"><div class="panel-head"><h2 class="panel-h">Salespeople today</h2></div>' + SV.table({
-          cols: [
-            { label: 'Salesperson', mobileLabel: '', cls: 'col-main', render: function (x) { return '<strong>' + esc(x.FullName) + '</strong>' + (x.checkedInAt ? '<span class="sub live">On site at ' + esc(x.checkedInAt) + '</span>' : ''); } },
-            { label: 'Attendance', render: function (x) {
-              const a = x.attendance;
-              if (x.Role === 'Admin') return '—';
-              if (!a) return '<span class="badge b-mute">Not punched in</span>';
-              return esc(SV.fmtTime(a.PunchInTime)) + ' to ' + (a.PunchOutTime ? esc(SV.fmtTime(a.PunchOutTime)) : '<span class="badge b-active">On duty</span>');
-            } },
-            { label: 'Planned', render: function (x) { return x.plannedToday; } },
-            { label: 'Completed', render: function (x) { return x.completedToday; } },
-            { label: 'Flagged far', render: function (x) { return x.flaggedToday ? '<span class="num-flag">' + x.flaggedToday + '</span>' : 0; } },
-            { label: 'Leads', render: function (x) { return x.leads; } },
-            { label: 'Accounts', render: function (x) { return x.accounts; } },
-            { label: 'Last login', render: function (x) { return x.LastLogin ? esc(SV.fmtDateTime(x.LastLogin)) : 'Never'; } }
-          ], rows: d.team, cls: 'compact'
-        }) + '</section>';
-        html += '<section class="panel"><div class="panel-head"><h2 class="panel-h">Check-ins today</h2><span class="muted small">' + d.todayCheckins.length + ' recorded</span></div><div id="db-map" class="map-box map-box-md"></div></section>';
-      }
-      body.innerHTML = html;
-      if (admin) {
-        const mk = d.todayCheckins.filter(function (l) { return l.CheckInLat != null; }).map(function (l) {
-          const cl = SV.flagColor(l.CheckInFlag);
-          return { lat: l.CheckInLat, lng: l.CheckInLng, title: l.CustomerName, color: SV.maps.COLORS[cl], info: '<div class="iw"><strong>' + esc(l.CustomerName) + '</strong><br>' + esc(l.UserName) + ', ' + esc(SV.fmtTime(l.CheckInTime)) + '<br>' + esc(SV.fmtDistance(l.CheckInDistanceM)) + ' from customer</div>' };
-        });
-        const m = body.querySelector('#db-map');
-        if (mk.length) SV.maps.show(m, { markers: mk }); else m.innerHTML = '<div class="map-fallback"><p class="muted">No check-ins yet today</p></div>';
-      }
-      SV.visits.tick(body);
+      paint(res.data);
       body.addEventListener('click', function (e) { const g = e.target.closest('[data-go]'); if (g) SV.go(g.dataset.go); });
       root.querySelector('.head-actions').addEventListener('click', function (e) { const g = e.target.closest('[data-go]'); if (g) SV.go(g.dataset.go); });
       SV.bind(root, Object.assign(SV.visits.handlers(reload), SV.attendance ? SV.attendance.handlers(reload) : {}, {
         'add-lead': function () { SV.openCustomerForm('Lead', null, function () { SV.cacheClear(); SV.route(); }); }
       }));
+      if (res.refreshing) res.refreshing.then(function (n) {      // shown from memory first, then brought up to date
+        if (root.isConnected && n && !n.__partial && JSON.stringify(n) !== JSON.stringify(res.data)) paint(n);
+      }).catch(function () { /* keep what is on screen */ });
     }
   };
 })();
@@ -3574,8 +3747,16 @@ li.pk-row.sel { background: var(--brand-t); }
     title: 'Team', admin: true,
     async render(root) {
       root.innerHTML = '<div class="page-head"><div><h1>Team</h1><p class="page-sub" id="tm-sub"></p></div><div class="head-actions"><button class="btn btn-primary" data-act="add">' + icon('plus') + 'Add salesperson</button></div></div><div id="tm-list">' + SV.skeleton(4) + '</div>';
-      let users;
-      try { users = (await SV.api('userList')).users; } catch (e) { root.querySelector('#tm-list').innerHTML = SV.empty({ icon: 'alert', title: 'Could not load the team', text: e.message }); return; }
+      let users, res;
+      try { res = await SV.read('userList'); users = res.data.users; }
+      catch (e) {
+        root.querySelector('#tm-list').innerHTML = SV.empty({ icon: 'alert', title: 'Could not load the team', text: SV.errText(e), actionHtml: '<button class="btn btn-primary" data-act="retry">Try again</button>' });
+        SV.bind(root, { retry: function () { SV.route(); } });
+        return;
+      }
+      if (res.refreshing) res.refreshing.then(function (d) {      // shown from memory, then brought up to date
+        if (root.isConnected && d && !d.__partial && JSON.stringify(d.users) !== JSON.stringify(users)) SV.route();
+      }).catch(function () { /* keep what is on screen */ });
       root.querySelector('#tm-sub').textContent = users.filter(function (u) { return u.Active; }).length + ' active of ' + users.length;
       root.querySelector('#tm-list').innerHTML = SV.table({
         cols: [
@@ -3715,7 +3896,7 @@ document.querySelectorAll("[data-brand]").forEach(function (e) { e.setAttribute(
     const h = '#/' + name + qs;
     if (location.hash === h) SV.route(); else location.hash = h;
   };
-  let lastName = null;
+  let lastName = null, routeSeq = 0;
   SV.route = async function () {
     if (!SV.state.user) return;
     const m = /^#\/([a-z]+)(?:\?(.*))?$/.exec(location.hash);
@@ -3727,6 +3908,7 @@ document.querySelectorAll("[data-brand]").forEach(function (e) { e.setAttribute(
       history.replaceState(null, '', '#/dashboard');
     }
     SV.runLeaveHooks();
+    const my = ++routeSeq;
     const root = document.createElement('div');
     root.className = 'page';
     $('view').replaceChildren(root);
@@ -3735,12 +3917,19 @@ document.querySelectorAll("[data-brand]").forEach(function (e) { e.setAttribute(
     document.title = page.title + ' | ' + S.CompanyName;
     const tb = $('tb-title'); if (tb) tb.textContent = page.title;
     if (name !== lastName) window.scrollTo(0, 0);
+    // If the first load is slow (Apps Script waking up), say so instead of leaving a silent skeleton.
+    const slow = setTimeout(function () {
+      const sk = root.querySelector('.skeleton');
+      if (sk && !root.querySelector('.slow-hint')) sk.insertAdjacentHTML('afterend', '<p class="slow-hint muted" role="status">Still loading. The server is slow to respond right now, so this can take a little longer.</p>');
+    }, 8000);
     try { await page.render(root, q); }
     catch (e) {
-      console.error(e);
-      root.innerHTML = SV.empty({ icon: 'alert', title: 'Something went wrong', text: e.message || 'Please try again.', actionHtml: '<button class="btn btn-primary" data-act="retry">Try again</button>' });
+      root.innerHTML = SV.empty({ icon: 'alert', title: 'Something went wrong', text: SV.errText(e), actionHtml: '<button class="btn btn-primary" data-act="retry">Try again</button>' });
       SV.bind(root, { retry: function () { SV.route(); } });
     }
+    clearTimeout(slow);
+    root.querySelectorAll('.slow-hint').forEach(function (n) { n.remove(); });
+    if (my !== routeSeq) return;                              // the person already moved on to another page
     if (name !== lastName) { const h1 = root.querySelector('h1'); if (h1) { h1.tabIndex = -1; h1.focus({ preventScroll: true }); } }
     lastName = name;
   };
@@ -3783,8 +3972,11 @@ document.querySelectorAll("[data-brand]").forEach(function (e) { e.setAttribute(
     show('shell');
     SV.renderChrome();
     if (!/^#\/[a-z]/.test(location.hash)) history.replaceState(null, '', '#/dashboard');
-    if (SV.state.user.MustChangePassword) { SV.afterPasswordChange = function () { SV.renderChrome(); SV.route(); }; SV.openPasswordModal(true); }
-    else SV.route();
+    const warm = function () {      // warm the lists the other screens need, so switching pages opens from memory
+      SV.prefetch(SV.isAdmin() ? ['leadList', 'accountList', 'users'] : ['leadList', 'accountList', 'todayVisits']);
+    };
+    if (SV.state.user.MustChangePassword) { SV.afterPasswordChange = function () { SV.renderChrome(); SV.route(); warm(); }; SV.openPasswordModal(true); }
+    else { SV.route(); warm(); }
   }
 
   function wireLogin() {
@@ -3813,7 +4005,15 @@ document.querySelectorAll("[data-brand]").forEach(function (e) { e.setAttribute(
     });
   }
 
+  const NAV_DATA = { leads: 'leadList', accounts: 'accountList', today: 'todayVisits', dashboard: 'dashboard', team: 'userList' };
   function wireGlobal() {
+    const warm = function (e) {
+      const a = e.target.closest && e.target.closest('[data-nav]');
+      const act = a && NAV_DATA[a.dataset.nav];
+      if (act && SV.state.user && !SV.state.user.MustChangePassword) SV.read(act, undefined, { ttl: [10000, 600000] }).catch(function () { /* quiet */ });
+    };
+    document.addEventListener('pointerover', warm);
+    document.addEventListener('focusin', warm);
     document.addEventListener('click', function (e) {
       const a = e.target.closest('[data-act]');
       if (!a) return;
