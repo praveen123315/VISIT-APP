@@ -1609,7 +1609,7 @@ li.pk-row.sel { background: var(--brand-t); }
       { f: 'ContactPerson', label: 'Contact Person', alias: ['contactperson', 'contact', 'contactname', 'contactpersonname', 'person', 'ownername'] },
       { f: 'Mobile', label: 'Mobile', alias: ['mobile', 'mobileno', 'mobilenumber', 'phone', 'phoneno', 'phonenumber', 'contactno', 'contactnumber', 'cell', 'whatsapp'] },
       { f: 'Email', label: 'Email', alias: ['email', 'emailid', 'emailaddress', 'mail'] },
-      { f: 'Address', label: 'Address', req: true, alias: ['address', 'fulladdress', 'streetaddress'] },
+      { f: 'Address', label: 'Address', req: isLead, alias: ['address', 'fulladdress', 'streetaddress'] },
       { f: 'City', label: 'City', alias: ['city', 'town'] },
       { f: 'State', label: 'State', alias: ['state', 'province'] },
       { f: 'Industry', label: 'Industry', alias: ['industry', 'sector', 'segment'] }
@@ -1640,7 +1640,7 @@ li.pk-row.sel { background: var(--brand-t); }
     const isLead = kind === 'Lead';
     const miss = [];
     if (!r.Company) miss.push('Company');
-    if (!r.Address) miss.push('Address');
+    if (isLead && !r.Address) miss.push('Address');
     if (miss.length) return miss.join(' and ') + (miss.length === 1 ? ' is' : ' are') + ' required.';
     const digits = r.Mobile.replace(/\D/g, '');
     if (r.Mobile && (!/^[+0-9][0-9 ()\-]{5,19}$/.test(r.Mobile) || digits.length < 7 || digits.length > 15)) return 'Mobile number is not valid (leave it blank if unknown).';
@@ -1713,7 +1713,7 @@ li.pk-row.sel { background: var(--brand-t); }
     const help = [['Column', 'Required', 'Notes']].concat(spec.map(function (c) {
       let n = '';
       if (c.f === 'Mobile') n = 'Optional. 7 to 15 digits, may start with +.';
-      else if (c.f === 'Address') n = 'Required. Used to find the map location.';
+      else if (c.f === 'Address') n = kind === 'Lead' ? 'Required. Used to find the map location.' : 'Optional. Used to find the map location. If blank, the location is saved from the salesperson\'s GPS at the first visit.';
       else if (c.f === 'Company') n = 'Required.';
       else if (c.f === 'Status') n = kind === 'Lead' ? 'One of: ' + S.LeadStatuses.join(', ') + '. Blank = ' + S.LeadStatuses[0] + '.' : 'Active or Inactive. Blank = Active.';
       else if (c.f === 'AssignedTo') n = 'Salesperson username or full name. Blank = unassigned.';
@@ -1721,7 +1721,7 @@ li.pk-row.sel { background: var(--brand-t); }
       else if (c.f === 'Source') n = 'For example: ' + S.LeadSources.slice(0, 4).join(', ') + '.';
       return [c.label, c.req ? 'Yes' : 'No', n];
     }));
-    help.push([], ['Only Company Name and Address are required. Keep the headings in row 1 of the first sheet. Records with the same company and mobile (or the same address when there is no mobile) are skipped.']);
+    help.push([], [(kind === 'Lead' ? 'Only Company Name and Address are required.' : 'Only Company Name is required.') + ' Keep the headings in row 1 of the first sheet. Records with the same company and mobile (or the same address when there is no mobile) are skipped.']);
     const hs = X.utils.aoa_to_sheet(help);
     hs['!cols'] = [{ wch: 20 }, { wch: 10 }, { wch: 80 }];
     X.utils.book_append_sheet(wb, hs, 'Instructions');
@@ -1745,7 +1745,7 @@ li.pk-row.sel { background: var(--brand-t); }
 
     function stepChoose(err) {
       body(
-        '<p class="muted">Upload an Excel file (.xlsx or .xls) or a CSV file. The first row must hold the column headings. Only <strong>Company Name</strong> and <strong>Address</strong> are required; everything else is optional. Each record is checked before anything is saved.</p>' +
+        '<p class="muted">Upload an Excel file (.xlsx or .xls) or a CSV file. The first row must hold the column headings. ' + (isLead ? 'Only <strong>Company Name</strong> and <strong>Address</strong> are required' : 'Only <strong>Company Name</strong> is required (the address is optional)') + '; everything else is optional. Each record is checked before anything is saved.</p>' +
         (err ? '<div class="notice" role="alert">' + esc(err) + '</div>' : '') +
         '<label class="dropzone" id="im-drop"><input type="file" id="im-file" accept=".xlsx,.xls,.csv,application/vnd.openxmlformats-officedocument.spreadsheetml.sheet,application/vnd.ms-excel,text/csv" hidden>' +
         icon('download') + '<strong>Choose a file</strong><span class="muted small">or drop it here</span></label>' +
