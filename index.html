@@ -24,7 +24,7 @@ window.APP_CONFIG = {
 
   APP_NAME: 'Sales Visit Manager',                 // shown on the login page until the Settings sheet loads
   DEFAULT_MAP_CENTER: { lat: 28.6139, lng: 77.2090 }, // used when there is nothing to show on a map
-  REQUEST_TIMEOUT_MS: 30000
+  REQUEST_TIMEOUT_MS: 60000          // Apps Script can take several seconds to wake up after being idle
 };
 </script>
   <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
@@ -594,12 +594,6 @@ li.pk-row.sel { background: var(--brand-t); }
 .rp-table td.wrap { white-space: normal; min-width: 200px; max-width: 320px; }
 .rp-body .table-wrap { overflow-x: auto; }
 .rp-table tr.tot td { background: var(--brand-t); font-weight: 600; border-top: 2px solid var(--brand); }
-.rp-claim { margin-bottom: 14px; }
-.rp-claim .panel-h { font-size: 15px; }
-.rp-claim-grid { display: flex; flex-wrap: wrap; gap: 10px; align-items: flex-end; }
-.rp-claim-grid .input { height: 38px; }
-.rp-claim-note { flex: 1 1 200px; }
-.rp-claim .small { margin: 8px 0 0; }
 .rp-filters .mini[hidden] { display: none; }
 .rp-filters #rp-cust { min-width: 220px; }
 @media (max-width: 720px) { .rp-filters #rp-cust { min-height: 52px; } }
@@ -612,20 +606,8 @@ li.pk-row.sel { background: var(--brand-t); }
 }
 @media (max-width: 760px) {
   .rp-head { flex-direction: column; }
-  .rp-claim-grid .mini, .rp-claim-grid .btn { flex: 1 1 100%; }
-  .rp-table td.wrap { max-width: none; min-width: 0; }
-  /* the day-by-day attendance grid stays a real table and scrolls sideways */
-  .table-wrap:has(.table.keep) { overflow-x: auto; background: var(--surface); border: 1px solid var(--line); border-radius: var(--r-l); }
-  .table.keep { display: table; width: max-content; min-width: 100%; }
-  .table.keep thead { display: table-header-group; }
-  .table.keep tbody { display: table-row-group; }
-  .table.keep tr { display: table-row; background: none; border: 0; padding: 0; margin: 0; }
-  .table.keep td, .table.keep th { display: table-cell; width: auto; padding: 8px 10px; text-align: center; border-bottom: 1px solid var(--line-2); }
-  .table.keep td::before { display: none; }
-  .table.keep td.col-main, .table.keep th:first-child { text-align: left; position: sticky; left: 0; background: var(--surface); }
+    .rp-table td.wrap { max-width: none; min-width: 0; }
 }
-.table.keep td, .table.keep th { text-align: center; padding: 8px 8px; }
-.table.keep td.col-main, .table.keep th:first-child { text-align: left; position: sticky; left: 0; background: var(--surface); z-index: 1; }
 </style>
 </head>
 <body>
@@ -721,13 +703,24 @@ li.pk-row.sel { background: var(--brand-t); }
   }
   SV.ApiError = ApiError;
 
+  // Actions that only read data are safe to repeat, so one slow or dropped reply is retried automatically.
+  const READ_ONLY = /(List|Get)$|^(dashboard|todayVisits|visitHistory|attendanceToday|me|ping|reportCatalog|reportRun)$/;
+
   /** SV.api('leadList', {…}) -> data. Throws ApiError with .code and a user-friendly message. */
-  SV.api = async function (action, params) {
+  SV.api = async function (action, params, opts) {
+    try { return await call(action, params, opts); }
+    catch (e) {
+      if (e && e.code === 'NETWORK' && READ_ONLY.test(action)) return call(action, params, Object.assign({}, opts, { timeout: 90000 }));
+      throw e;
+    }
+  };
+
+  async function call(action, params, opts) {
     const cfg = window.APP_CONFIG;
     if (!SV.apiConfigured()) throw new ApiError('CONFIG', 'The app is not connected to its backend yet. Set API_URL in js/config.js.');
     const sess = SV.session.load();
     const ctrl = new AbortController();
-    const timer = setTimeout(function () { ctrl.abort(); }, cfg.REQUEST_TIMEOUT_MS || 30000);
+    const timer = setTimeout(function () { ctrl.abort(); }, (opts && opts.timeout) || cfg.REQUEST_TIMEOUT_MS || 30000);
     busy(1);
     let res;
     try {
@@ -760,7 +753,7 @@ li.pk-row.sel { background: var(--brand-t); }
       throw new ApiError(code, msg);
     }
     return body.data;
-  };
+  }
 
   /* small in-memory cache for lookup lists (customer pickers) */
   const cache = {};
@@ -821,6 +814,7 @@ li.pk-row.sel { background: var(--brand-t); }
     refresh: '<path d="M3 12a9 9 0 0 1 9-9 9.75 9.75 0 0 1 6.74 2.74L21 8"/><path d="M21 3v5h-5"/><path d="M21 12a9 9 0 0 1-9 9 9.75 9.75 0 0 1-6.74-2.74L3 16"/><path d="M8 16H3v5"/>',
     lock: '<rect x="3" y="11" width="18" height="11" rx="2"/><path d="M7 11V7a5 5 0 0 1 10 0v4"/>',
     eye: '<path d="M2 12s3.5-7 10-7 10 7 10 7-3.5 7-10 7S2 12 2 12Z"/><circle cx="12" cy="12" r="3"/>',
+    trash: '<path d="M3 6h18M8 6V4h8v2M6 6l1 14h10l1-14M10 10v6M14 10v6"/>',
     chart: '<path d="M3 3v18h18"/><path d="m7 15 4-4 3 3 5-6"/>',
     list: '<path d="M8 6h13M8 12h13M8 18h13M3 6h.01M3 12h.01M3 18h.01"/>'
   };
@@ -919,9 +913,11 @@ li.pk-row.sel { background: var(--brand-t); }
   };
   const LEAD_BADGE = { 'New': 'b-planned', 'Contacted': 'b-teal', 'Qualified': 'b-teal', 'Quotation Sent': 'b-active', 'Negotiation': 'b-active', 'Won': 'b-done', 'Lost': 'b-mute', 'Active': 'b-done', 'Inactive': 'b-mute' };
   SV.statusBadge = function (s) { return '<span class="badge ' + (LEAD_BADGE[s] || 'b-mute') + '">' + esc(s || '—') + '</span>'; };
+  SV.flagColor = function (flag) { return flag === 'FAR' ? 'flag' : (flag === 'OK' || flag === 'LOCATION_CAPTURED') ? 'done' : 'mute'; };
   SV.flagChip = function (flag, dist) {
     if (flag === 'OK') return '<span class="chip c-done" title="Checked in within the allowed distance">' + icon('pin') + esc(SV.fmtDistance(dist)) + ' from customer</span>';
-    if (flag === 'FAR') return '<span class="chip c-flag" title="Checked in far from the customer location">' + icon('alert') + esc(SV.fmtDistance(dist)) + ' away, flagged</span>';
+    if (flag === 'FAR') return '<span class="chip c-flag" title="Not at the customer address: checked in outside the allowed distance from its saved location">' + icon('alert') + esc(SV.fmtDistance(dist)) + ' away, flagged</span>';
+    if (flag === 'LOCATION_CAPTURED') return '<span class="chip c-done" title="First visit: this position was saved as the customer\'s verified location">' + icon('pin') + 'Location saved</span>';
     if (flag === 'NO_CUSTOMER_LOCATION') return '<span class="chip c-mute" title="The customer has no map location, so distance could not be checked">' + icon('pin') + 'No customer location</span>';
     return '';
   };
@@ -1432,9 +1428,11 @@ li.pk-row.sel { background: var(--brand-t); }
         const hasC = c.Lat != null && c.Lng != null;
         const dist = hasC ? SV.haversine(pos.lat, pos.lng, c.Lat, c.Lng) : null;
         let cls, ic, title, text;
-        if (dist == null) { cls = 'mute'; ic = 'pin'; title = 'Customer location is not set'; text = 'Distance cannot be checked for this customer. The check-in is saved with your location.'; }
+        const capMax = S.CaptureMaxAccuracyM || 100, vague = pos.accuracy != null && pos.accuracy > capMax;
+        if (dist == null && vague) { cls = 'mute'; ic = 'pin'; title = 'GPS is too vague to save this customer\'s location'; text = 'Your GPS accuracy is about ' + Math.round(pos.accuracy) + ' m. Refresh your location (move to open sky) for a better fix, or continue and the location will be saved at a later visit.'; }
+        else if (dist == null) { cls = 'mute'; ic = 'pin'; title = 'This customer has no saved location yet'; text = 'When you check in, your current GPS position is saved as the customer\'s verified location. Later visits are checked against it.'; }
         else if (dist <= max) { cls = 'done'; ic = 'check'; title = 'You are ' + SV.fmtDistance(dist) + ' from the customer'; text = 'Within the allowed distance of ' + SV.fmtDistance(max) + '.'; }
-        else { cls = 'flag'; ic = 'alert'; title = 'You are ' + SV.fmtDistance(dist) + ' from the customer'; text = strict ? 'Check-in is only allowed within ' + SV.fmtDistance(max) + '. Move closer, then refresh your location.' : 'This is beyond the allowed ' + SV.fmtDistance(max) + ', so the check-in will be flagged for your manager.'; }
+        else { cls = 'flag'; ic = 'alert'; title = 'You do not appear to be at the customer address'; text = 'You are ' + SV.fmtDistance(dist) + ' from its saved location. ' + (strict ? 'Check-in is only allowed within ' + SV.fmtDistance(max) + '. Move closer, then refresh your location.' : 'This is beyond the allowed ' + SV.fmtDistance(max) + ', so the check-in will be flagged for your manager.'); }
         $('#ci-state').className = 'ci-state s-' + cls;
         $('#ci-state').innerHTML = icon(ic) + '<div><strong>' + esc(title) + '</strong><p>' + esc(text) + '</p><p class="small muted">GPS accuracy about ' + esc(Math.round(pos.accuracy)) + ' m</p></div>';
         $('#ci-retry').disabled = false;
@@ -1460,7 +1458,7 @@ li.pk-row.sel { background: var(--brand-t); }
         try {
           const r = await SV.api('checkIn', { VisitID: v.VisitID, lat: pos.lat, lng: pos.lng, accuracy: pos.accuracy, address: address });
           ctl.close();
-          SV.ok('Checked in at ' + SV.fmtTime(r.visit.Log.CheckInTime) + (r.flag === 'FAR' ? '. Flagged: ' + SV.fmtDistance(r.distanceM) + ' from the customer.' : '.'));
+          SV.ok('Checked in at ' + SV.fmtTime(r.visit.Log.CheckInTime) + (r.flag === 'FAR' ? '. Flagged: not at the customer address (' + SV.fmtDistance(r.distanceM) + ' away).' : r.locationCaptured ? '. Your location is now saved as the customer\'s verified location.' : r.lowAccuracy ? '. GPS was too vague to save the customer\'s location.' : '.'));
           if (done) done(r);
         } catch (e) { SV.fail(e); SV.busy(btn, false); }
       });
@@ -1841,56 +1839,101 @@ li.pk-row.sel { background: var(--brand-t); }
       ], list);
     }
 
+    /* Sends the file in small batches. Every batch is retried on a bad connection and carries an id, so a batch whose
+       reply was lost is never saved twice. Map positions are looked up afterwards in a separate, even smaller step. */
+    const BATCH = 50, GEO_BATCH = 10, RETRIES = 3;
+    const wait = function (ms) { return new Promise(function (r) { setTimeout(r, ms); }); };
+    const transient = function (e) { return e && (e.code === 'NETWORK' || e.code === 'BAD_RESPONSE' || e.code === 'BUSY' || e.code === 'SERVER'); };
+    async function callWithRetry(action, params, onWait) {
+      for (let attempt = 1; ; attempt++) {
+        try { return await SV.api(action, params, { timeout: 90000 }); }
+        catch (e) {
+          if (!transient(e) || attempt >= RETRIES || ctl.closed) throw e;
+          if (onWait) onWait(attempt);
+          await wait(1500 * attempt);
+        }
+      }
+    }
+
+    const job = { rows: [], total: 0, sent: 0, tally: null, problems: [], newIds: [], batchSeq: 0, geoDone: 0, geoLocated: 0, stopped: '' };
+
     async function run() {
       const geo = st.geo !== false;
-      busy = true; ctl.root.querySelector('.modal-head [data-close]') && (ctl.root.querySelector('.modal-head [data-close]').hidden = true);
-      const rows = st.valid.map(function (r) { const o = Object.assign({}, r); if (!admin) delete o.AssignedTo; return o; });
-      const total = rows.length, size = geo ? 20 : 100;
-      const tally = { inserted: 0, duplicates: 0, failed: 0, unlocated: 0 }, problems = [];
-      let sent = 0, stopped = '';
-      body('<div class="im-progress"><p><strong id="im-msg">Importing…</strong></p><div class="bar"><i id="im-bar" style="width:0%"></i></div><p class="small muted">Keep this window open until it finishes.</p></div>');
+      job.rows = st.valid.map(function (r) { const o = Object.assign({}, r); if (!admin) delete o.AssignedTo; return o; });
+      job.total = job.rows.length; job.sent = 0; job.problems = []; job.newIds = []; job.stopped = '';
+      job.tally = { inserted: 0, duplicates: 0, failed: 0, unlocated: 0 };
+      job.geoDone = 0; job.geoLocated = 0; job.geo = geo; job.runId = Date.now().toString(36);
+      await proceed();
+    }
+
+    async function proceed() {
+      busy = true; const x = ctl.root.querySelector('.modal-head [data-close]'); if (x) x.hidden = true;
+      job.stopped = '';
+      const tally = job.tally, problems = job.problems;
+      body('<div class="im-progress"><p><strong id="im-msg">Importing…</strong></p><div class="bar"><i id="im-bar" style="width:0%"></i></div><p class="small muted" id="im-sub">Keep this window open until it finishes.</p></div>');
       foot('');
-      const upd = function () {
-        const pct = Math.round(sent / total * 100);
-        ctl.q('#im-bar').style.width = pct + '%';
-        ctl.q('#im-msg').textContent = 'Importing ' + Math.min(sent, total) + ' of ' + total + '…';
-      };
-      for (let i = 0; i < rows.length;) {
-        let batch = rows.slice(i, i + size);
-        while (batch.length > 1 && JSON.stringify(batch).length > 120000) batch = batch.slice(0, Math.ceil(batch.length / 2));
+      const bar = function (done, total, text) { if (ctl.closed) return; ctl.q('#im-bar').style.width = Math.round(done / Math.max(1, total) * 100) + '%'; ctl.q('#im-msg').textContent = text; };
+      const sub = function (t) { if (!ctl.closed && ctl.q('#im-sub')) ctl.q('#im-sub').textContent = t; };
+      const keepOpen = 'Keep this window open until it finishes.';
+      bar(job.sent, job.total, 'Importing ' + job.sent + ' of ' + job.total + '…');
+
+      // step 1: save the records
+      while (job.sent < job.total && !ctl.closed) {
+        let batch = job.rows.slice(job.sent, job.sent + BATCH);
+        while (batch.length > 1 && JSON.stringify(batch).length > 150000) batch = batch.slice(0, Math.ceil(batch.length / 2));
+        const batchId = job.runId + '-' + job.sent + '-' + batch.length;
         try {
-          const r = await SV.api(isLead ? 'leadImport' : 'accountImport', { rows: batch, geocode: geo });
+          const r = await callWithRetry(isLead ? 'leadImport' : 'accountImport', { rows: batch, geocode: false, batchId: batchId }, function (n) { sub('Connection problem. Trying again (' + n + ' of ' + (RETRIES - 1) + ')…'); });
           tally.inserted += r.inserted; tally.duplicates += r.duplicates; tally.failed += r.failed; tally.unlocated += r.unlocated;
           r.results.forEach(function (x) {
-            if (x.status !== 'ok') {
-              const src = batch.find(function (b) { return b.row === x.row; }) || {};
-              problems.push({ row: x.row, company: src.Company || '', message: x.status === 'duplicate' ? x.message : x.message });
-            }
+            if (x.status === 'ok') { if (x.id) job.newIds.push(x.id); return; }
+            const src = batch.find(function (b) { return b.row === x.row; }) || {};
+            problems.push({ row: x.row, company: src.Company || '', message: x.message });
           });
-          i += batch.length; sent = i;
-          if (ctl.closed) break;
-          upd();
-        } catch (e) { stopped = e.message || 'The connection was interrupted.'; break; }
+          job.sent += batch.length;
+          bar(job.sent, job.total, 'Importing ' + Math.min(job.sent, job.total) + ' of ' + job.total + '…'); sub(keepOpen);
+        } catch (e) { job.stopped = e.message || 'The connection was interrupted.'; break; }
+      }
+
+      // step 2: map positions for the new records (failures here never undo the import)
+      if (!job.stopped && !ctl.closed && job.geo && job.newIds.length && job.geoDone < job.newIds.length) {
+        let geoStop = false;
+        while (job.geoDone < job.newIds.length && !ctl.closed && !geoStop) {
+          const ids = job.newIds.slice(job.geoDone, job.geoDone + GEO_BATCH);
+          bar(job.geoDone, job.newIds.length, 'Finding map locations… ' + job.geoDone + ' of ' + job.newIds.length); sub(keepOpen);
+          try {
+            const r = await callWithRetry('geocodePending', { entityType: kind, ids: ids });
+            job.geoLocated += r.located;
+          } catch (e) { geoStop = true; }
+          job.geoDone += ids.length;
+        }
+        tally.unlocated = Math.max(0, job.newIds.length - job.geoLocated);
       }
       busy = false;
       SV.cacheClear();
       if (ctl.closed) { if (tally.inserted && done) done(); return; }
-      const left = total - sent;
+      finish();
+    }
+
+    function finish() {
+      const tally = job.tally, problems = job.problems, left = job.total - job.sent;
       body(
-        (stopped ? '<div class="notice" role="alert"><strong>The import stopped.</strong> ' + esc(stopped) + ' ' + left + ' ' + (left === 1 ? 'record was' : 'records were') + ' not sent. Run the import again with the same file; records already saved are skipped as duplicates.</div>' : '') +
+        (job.stopped ? '<div class="notice" role="alert"><strong>The import paused.</strong> ' + esc(job.stopped) + ' ' + left + ' ' + (left === 1 ? 'record has' : 'records have') + ' not been sent yet. Records already saved are kept. Press <strong>Continue import</strong> when your connection is back.</div>' : '') +
         '<div class="ledger slim three">' +
         '<div class="fig' + (tally.inserted ? ' good' : '') + '"><b>' + tally.inserted + '</b><span>Imported</span></div>' +
         '<div class="fig"><b>' + tally.duplicates + '</b><span>Already existed</span></div>' +
         '<div class="fig' + (tally.failed ? ' flag' : '') + '"><b>' + tally.failed + '</b><span>Failed</span></div></div>' +
-        (tally.unlocated && tally.inserted ? '<p class="small muted">' + tally.unlocated + ' could not be placed on the map from their address. Open the record and pin its location so check-in can measure distance.</p>' : '') +
+        (tally.unlocated && tally.inserted ? '<p class="small muted">' + tally.unlocated + ' ' + (tally.unlocated === 1 ? 'record has' : 'records have') + ' no map location yet. It is saved from the salesperson\'s GPS at the first visit, or you can pin it by editing the record.</p>' : '') +
         (problems.length ? '<h3 class="im-h">Not imported</h3>' + SV.table({
           cols: [{ label: 'Row', render: function (b) { return b.row; } }, { label: 'Company', render: function (b) { return esc(b.company || '—'); } }, { label: 'Reason', cls: 'col-main', mobileLabel: 'Reason', render: function (b) { return esc(b.message); } }],
           rows: problems.slice(0, 8), cls: 'compact'
         }) : ''));
-      foot((problems.length ? '<button class="btn btn-ghost" id="im-pcsv">' + icon('download') + 'Download list</button>' : '') + '<button class="btn btn-primary" id="im-done">Done</button>');
+      foot((problems.length ? '<button class="btn btn-ghost" id="im-pcsv">' + icon('download') + 'Download list</button>' : '') +
+        (job.stopped ? '<button class="btn btn-primary" id="im-resume">Continue import</button><button class="btn btn-ghost" id="im-done">Stop here</button>' : '<button class="btn btn-primary" id="im-done">Done</button>'));
       const pc = ctl.q('#im-pcsv'); if (pc) pc.addEventListener('click', function () { problemCsv(problems); });
       ctl.q('#im-done').addEventListener('click', function () { ctl.close(tally.inserted ? 'refresh' : ''); });
-      if (tally.inserted) SV.ok(tally.inserted + ' ' + (tally.inserted === 1 ? kind.toLowerCase() : noun) + ' imported.');
+      const rs = ctl.q('#im-resume'); if (rs) rs.addEventListener('click', proceed);
+      if (!job.stopped && tally.inserted) SV.ok(tally.inserted + ' ' + (tally.inserted === 1 ? kind.toLowerCase() : noun) + ' imported.');
     }
 
     stepChoose();
@@ -2037,7 +2080,7 @@ li.pk-row.sel { background: var(--brand-t); }
       kv('Added', esc(SV.fmtDate(SV.isoDate(c.CreatedAt)))) +
       '</dl></div><div>' +
       '<div id="cd-map" class="map-box map-box-sm"></div>' +
-      (c.Lat == null ? '<p class="small muted">No map location yet. Edit this record and pin the location so check-ins can be verified.</p>' : '') +
+      (c.Lat == null ? '<p class="small muted">No map location yet. It is saved from the salesperson\'s GPS at the first visit' + (canEdit ? ', or edit this record and pin it now.' : '.') + '</p>' : c.LocationSource === 'Visit' ? '<p class="small muted">Location verified from the first visit.</p>' : '') +
       '</div></div>' +
       '<h4 class="sub-h">Recent visits</h4>' +
       (visits ? '<ul class="vh-list">' + visits + '</ul>' : '<p class="muted">No visits yet.</p>');
@@ -2140,7 +2183,10 @@ li.pk-row.sel { background: var(--brand-t); }
           if (st.sel.size === 0) return;
           bar.innerHTML = '<strong>' + st.sel.size + ' selected</strong><select class="input" id="pc-assignee" aria-label="Assign to"><option value="">Assign to…</option>' +
             users.map(function (u) { return '<option value="' + esc(u.UserID) + '">' + esc(u.FullName) + '</option>'; }).join('') + '</select>' +
-            '<button class="btn btn-primary btn-sm" data-act="assign">Assign</button><button class="btn btn-ghost btn-sm" data-act="clear-sel">Clear</button>';
+            '<button class="btn btn-primary btn-sm" data-act="assign">Assign</button>' +
+            '<button class="btn btn-danger btn-sm" data-act="delete">' + icon('trash') + 'Delete</button>' +
+            (filtered().length > st.sel.size ? '<button class="btn btn-ghost btn-sm" data-act="select-all">Select all ' + filtered().length + '</button>' : '') +
+            '<button class="btn btn-ghost btn-sm" data-act="clear-sel">Clear</button>';
         };
         const reload = function () { SV.route(); };
         draw();
@@ -2166,6 +2212,36 @@ li.pk-row.sel { background: var(--brand-t); }
           plan: function (d) { SV.go('plan', isLead ? { lead: d.id } : { account: d.id }); },
           more: function () { st.limit += 50; draw(); },
           'clear-sel': function () { st.sel.clear(); draw(); drawBulk(); },
+          'select-all': function () { filtered().forEach(function (r) { st.sel.add(idOf(r)); }); draw(); drawBulk(); },
+          delete: async function (d, btn) {          // admin only (the bulk bar is only drawn for admins; the server checks again)
+            const ids = Array.from(st.sel), n = ids.length;
+            if (!n) return;
+            const names = rows.filter(function (r) { return st.sel.has(idOf(r)); }).slice(0, 3).map(function (r) { return r.Company; });
+            const what = n === 1 ? kind.toLowerCase() : plural;
+            const ok = await SV.confirm({
+              title: 'Delete ' + n + ' ' + what + '?', danger: true, confirmText: 'Delete ' + n,
+              message: names.join(', ') + (n > names.length ? ' and ' + (n - names.length) + ' more' : '') + ' will be permanently removed. Past visit history is kept. Visits still planned for ' + (n === 1 ? 'it' : 'them') + ' are cancelled. This cannot be undone.'
+            });
+            if (!ok) return;
+            SV.busy(btn, true, 'Deleting');
+            let deleted = 0, cancelled = 0, skipped = [], failed = '';
+            for (let i = 0; i < ids.length; i += 50) {
+              try {
+                const r = await SV.api('customerDelete', { entityType: kind, ids: ids.slice(i, i + 50) }, { timeout: 90000 });
+                deleted += r.deleted; cancelled += r.cancelledVisits; skipped = skipped.concat(r.skipped);
+                btn.querySelector('span:last-child') && (btn.querySelector('span:last-child').textContent = 'Deleting ' + Math.min(i + 50, n) + ' of ' + n);
+              } catch (e) { failed = e.message; break; }
+            }
+            SV.cacheClear();
+            if (deleted) SV.ok(deleted + ' ' + (deleted === 1 ? kind.toLowerCase() : plural) + ' deleted' + (cancelled ? '. ' + cancelled + ' planned ' + (cancelled === 1 ? 'visit' : 'visits') + ' cancelled' : '') + '.');
+            if (skipped.length || failed) {
+              await SV.confirm({
+                title: failed ? 'Deletion stopped' : 'Some records were not deleted', confirmText: 'OK', cancelText: 'Close',
+                message: (failed ? failed + ' ' : '') + skipped.slice(0, 6).map(function (x) { return (x.name || x.id) + ': ' + x.reason; }).join(' ') + (skipped.length > 6 ? ' And ' + (skipped.length - 6) + ' more.' : '')
+              });
+            }
+            reload();
+          },
           assign: async function (d, btn) {
             const uid = root.querySelector('#pc-assignee').value;
             if (!uid) { SV.toast('error', 'Choose a salesperson to assign to.'); return; }
@@ -2518,7 +2594,7 @@ li.pk-row.sel { background: var(--brand-t); }
    * VISIT HISTORY
    * ===================================================================== */
   function logDetail(l) {
-    const flagColor = l.CheckInFlag === 'FAR' ? 'flag' : l.CheckInFlag === 'OK' ? 'done' : 'mute';
+    const flagColor = SV.flagColor(l.CheckInFlag);
     const kv = function (k, v) { return v ? '<div><dt>' + esc(k) + '</dt><dd>' + v + '</dd></div>' : ''; };
     const ctl = SV.modal({
       title: 'Visit details', size: 'lg',
@@ -2558,7 +2634,6 @@ li.pk-row.sel { background: var(--brand-t); }
         '<label class="mini">Status<select class="input" id="vh-status"><option value="">All</option><option>Completed</option><option>In Progress</option></select></label>' +
         '<label class="check"><input type="checkbox" id="vh-flag"> Flagged only</label>' +
         '<label class="search">' + icon('search') + '<input type="search" id="vh-q" placeholder="Search customer, outcome, remarks" aria-label="Search history"></label></div>' +
-        (admin ? '<section class="panel" id="vh-team" hidden></section>' : '') +
         '<div id="vh-sum" class="ledger slim"></div>' +
         '<div id="vh-map" class="map-box map-box-md"></div>' +
         '<div id="vh-list">' + SV.skeleton(5) + '</div>';
@@ -2596,7 +2671,7 @@ li.pk-row.sel { background: var(--brand-t); }
         }) + (logs.length > shown.length ? '<div class="more"><button class="btn btn-ghost" data-act="more">Show more (' + (logs.length - shown.length) + ' hidden)</button></div>' : '');
         if (st.showMap) {
           const mk = logs.filter(function (l) { return l.CheckInLat != null; }).slice(0, 150).map(function (l) {
-            const c = l.CheckInFlag === 'FAR' ? 'flag' : l.CheckInFlag === 'OK' ? 'done' : 'mute';
+            const c = SV.flagColor(l.CheckInFlag);
             return { lat: l.CheckInLat, lng: l.CheckInLng, title: l.CustomerName, color: SV.maps.COLORS[c], info: '<div class="iw"><strong>' + esc(l.CustomerName) + '</strong><br>' + esc(l.UserName) + '<br>' + esc(SV.fmtDateTime(l.CheckInTime)) + '<br>' + esc(SV.fmtDistance(l.CheckInDistanceM)) + ' from customer</div>' };
           });
           if (mk.length) SV.maps.show(mapEl, { markers: mk }); else mapEl.innerHTML = '<div class="map-fallback"><p class="muted">No GPS positions in this period</p></div>';
@@ -2613,30 +2688,7 @@ li.pk-row.sel { background: var(--brand-t); }
         if (st.q) p.q = st.q;
         try { st.logs = (await SV.api('visitHistory', p)).logs; st.limit = 50; draw(); }
         catch (e) { listEl.innerHTML = SV.empty({ icon: 'alert', title: 'Could not load history', text: e.message }); }
-        if (admin) loadTeam();
       };
-      const loadTeam = async function () {
-        const box = root.querySelector('#vh-team');
-        try {
-          const r = await SV.api('report', { from: st.from, to: st.to });
-          const rows = r.rows.filter(function (x) { return x.Active || x.planned || x.checkins; });
-          st.report = rows;
-          box.hidden = false;
-          box.innerHTML = '<h2 class="panel-h">Team summary</h2>' + SV.table({
-            cols: [
-              { label: 'Salesperson', mobileLabel: '', cls: 'col-main', render: function (x) { return '<strong>' + esc(x.FullName) + '</strong>'; } },
-              { label: 'Planned', render: function (x) { return x.planned; } }, { label: 'Completed', render: function (x) { return x.completed; } },
-              { label: 'Missed', render: function (x) { return x.missed ? '<span class="num-flag">' + x.missed + '</span>' : 0; } },
-              { label: 'Check-ins', render: function (x) { return x.checkins; } },
-              { label: 'Flagged far', render: function (x) { return x.flagged ? '<span class="num-flag">' + x.flagged + '</span>' : 0; } },
-              { label: 'Avg visit', render: function (x) { return x.avgDurationMin ? esc(SV.fmtDuration(x.avgDurationMin)) : '—'; } },
-              { label: 'New leads', render: function (x) { return x.newLeads; } },
-              { label: 'Leads', render: function (x) { return x.leads; } }, { label: 'Accounts', render: function (x) { return x.accounts; } }
-            ], rows: rows, cls: 'compact'
-          });
-        } catch (e) { box.hidden = true; }
-      };
-
       const apply = SV.debounce(load, 250);
       root.querySelector('#vh-from').addEventListener('change', function (e) { if (e.target.value) { st.from = e.target.value; apply(); } });
       root.querySelector('#vh-to').addEventListener('change', function (e) { if (e.target.value) { st.to = e.target.value; apply(); } });
@@ -2923,7 +2975,7 @@ li.pk-row.sel { background: var(--brand-t); }
   <script>
 /* ---- js/xlsx-export.js ---- */
 /* Excel export for reports. Builds a formatted .xlsx in the browser (ExcelJS, loaded only when someone downloads).
- * SV.xlsx.download({ meta, reports, skipped }, filename) - one sheet per report, plus a Contents sheet when there are several. */
+ * SV.xlsx.download({ meta, reports }, filename) - one sheet per table of the report. */
 (function () {
   'use strict';
   const SV = window.SV = window.SV || {};
@@ -2953,7 +3005,7 @@ li.pk-row.sel { background: var(--brand-t); }
   }
 
   const BRAND = 'FF0B6E80', INK = 'FF1B2A33', MUTED = 'FF5B6B75', LINE = 'FFD5DCE0', TOTAL_BG = 'FFE6F1F3', STRIPE = 'FFF7FAFB';
-  const FLAG_TEXT = { 'Over-claimed': 1, 'No GPS trail': 1, 'Late': 1, 'Missed punch-out': 1, 'Never visited': 1, 'Checked in, never checked out': 1, 'Not visited': 1 };
+  const FLAG_TEXT = { 'Missed punch-out': 1, 'No punch-in': 1 };
   const MONTHS = ['Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun', 'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec'];
 
   const border = { style: 'thin', color: { argb: LINE } };
@@ -2989,7 +3041,7 @@ li.pk-row.sel { background: var(--brand-t); }
     const a = ws.getCell(1, 1); a.value = meta.company; a.font = { name: 'Calibri', size: 15, bold: true, color: { argb: BRAND } };
     const b = ws.getCell(2, 1); b.value = title; b.font = { name: 'Calibri', size: 13, bold: true, color: { argb: INK } };
     const c = ws.getCell(3, 1);
-    c.value = 'Period: ' + longDate(meta.from) + ' to ' + longDate(meta.to) + '   |   ' + meta.who + '   |   Generated ' + longDate(String(meta.generatedAt).slice(0, 10)) + ' ' + String(meta.generatedAt).slice(11, 16) + ' by ' + meta.generatedBy + (filters && filters.length ? '   |   Filters: ' + filters.join(', ') : '');
+    c.value = (meta.dated === false ? 'As on ' + longDate(meta.today) : 'Period: ' + longDate(meta.from) + ' to ' + longDate(meta.to)) + '   |   ' + meta.who + '   |   Generated ' + longDate(String(meta.generatedAt).slice(0, 10)) + ' ' + String(meta.generatedAt).slice(11, 16) + ' by ' + meta.generatedBy + (filters && filters.length ? '   |   Filters: ' + filters.join(', ') : '');
     c.font = { name: 'Calibri', size: 10, color: { argb: MUTED } };
     ws.getRow(1).height = 22; ws.getRow(2).height = 19;
   }
@@ -3011,7 +3063,6 @@ li.pk-row.sel { background: var(--brand-t); }
     hr.height = 34;
     // body
     const widths = cols.map(function (c) { return Math.min(50, Math.max(10, String(c.l).length * 1.0 + 3)); });
-    const matrix = rp.id === 'attSheet';
     rp.rows.forEach(function (r, ri) {
       const row = ws.getRow(HEAD + 1 + ri);
       cols.forEach(function (c, i) {
@@ -3020,16 +3071,12 @@ li.pk-row.sel { background: var(--brand-t); }
         const f = numFmt(c.t); if (f) cell.numFmt = f;
         cell.border = BOX;
         cell.font = { name: 'Calibri', size: 11, color: { argb: INK } };
-        cell.alignment = { vertical: 'top', horizontal: isNum(c.t) ? 'right' : (matrix && i > 0 ? 'center' : 'left'), wrapText: c.t === 'text' };
+        cell.alignment = { vertical: 'top', horizontal: isNum(c.t) ? 'right' : 'left', wrapText: c.t === 'text' };
         if (c.t === 'map' && v) cell.font = { name: 'Calibri', size: 11, color: { argb: 'FF1155CC' }, underline: true };
         if (ri % 2) cell.fill = { type: 'pattern', pattern: 'solid', fgColor: { argb: STRIPE } };
         if (c.t === 'text' && FLAG_TEXT[raw]) cell.font = { name: 'Calibri', size: 11, bold: true, color: { argb: 'FFB3261E' } };
-        if (matrix && i > 0 && raw) {
-          const col = raw === 'A' ? ['FFFDE7E5', 'FFB3261E'] : raw === 'P' ? ['FFE6F4EA', 'FF1E6B3A'] : raw === 'M' ? ['FFFFF3D6', 'FF8A5A00'] : raw === 'WO' ? ['FFEDEFF1', 'FF5B6B75'] : null;
-          if (col) { cell.fill = { type: 'pattern', pattern: 'solid', fgColor: { argb: col[0] } }; cell.font = { name: 'Calibri', size: 11, bold: true, color: { argb: col[1] } }; }
-        }
         const len = c.t === 'date' ? 12 : c.t === 'dur' ? 8 : c.t === 'map' ? 10 : String(raw == null ? '' : (c.t === 'pct' ? '100.0%' : raw)).length;
-        if (len > widths[i]) widths[i] = Math.min(matrix && i > 0 ? 6 : 50, len + 2);
+        if (len > widths[i]) widths[i] = Math.min(50, len + 2);
       });
     });
     let next = HEAD + 1 + rp.rows.length;
@@ -3078,58 +3125,14 @@ li.pk-row.sel { background: var(--brand-t); }
     return ws.name;
   }
 
-  function fillContents(ws, data, names) {
-    const meta = data.meta;
-    addTitleBlock(ws, meta, 'Sales reports', 4, meta.filters);
-    const HEAD = 5;
-    ['Sheet', 'What it shows', 'Rows'].forEach(function (h, i) {
-      const c = ws.getRow(HEAD).getCell(i + 1);
-      c.value = h; c.font = { bold: true, color: { argb: 'FFFFFFFF' } }; c.fill = { type: 'pattern', pattern: 'solid', fgColor: { argb: BRAND } }; c.border = BOX;
-      c.alignment = { vertical: 'middle', horizontal: i === 2 ? 'right' : 'left' };
-    });
-    ws.getRow(HEAD).height = 24;
-    let r = HEAD + 1, group = '';
-    data.reports.forEach(function (rp, i) {
-      if (rp.group !== group) {
-        group = rp.group;
-        ws.mergeCells(r, 1, r, 3);
-        const g = ws.getCell(r, 1); g.value = group; g.font = { bold: true, color: { argb: BRAND } }; g.fill = { type: 'pattern', pattern: 'solid', fgColor: { argb: TOTAL_BG } };
-        r++;
-      }
-      const a = ws.getCell(r, 1), b = ws.getCell(r, 2), c = ws.getCell(r, 3);
-      a.value = { text: rp.title, hyperlink: "#'" + names[i].replace(/'/g, "''") + "'!A1" };
-      a.font = { color: { argb: 'FF1155CC' }, underline: true };
-      b.value = rp.description; b.alignment = { wrapText: true, vertical: 'top' };
-      c.value = rp.rows.length; c.numFmt = '#,##0'; c.alignment = { horizontal: 'right', vertical: 'top' };
-      [a, b, c].forEach(function (x) { x.border = BOX; if (!x.alignment) x.alignment = { vertical: 'top' }; });
-      r++;
-    });
-    if (data.skipped && data.skipped.length) {
-      r++;
-      data.skipped.forEach(function (s) {
-        ws.mergeCells(r, 1, r, 3);
-        const c = ws.getCell(r, 1); c.value = 'Not included: ' + s.title + '. ' + s.reason;
-        c.font = { italic: true, color: { argb: 'FFB3261E' } }; c.alignment = { wrapText: true };
-        r++;
-      });
-    }
-    ws.getColumn(1).width = 38; ws.getColumn(2).width = 80; ws.getColumn(3).width = 10;
-    ws.views = [{ showGridLines: false }];
-    ws.pageSetup = { orientation: 'landscape', fitToPage: true, fitToWidth: 1, fitToHeight: 0, paperSize: 9 };
-    return ws;
-  }
-
-  /** Builds the workbook. Several reports get a Contents sheet first. */
+  /** Builds the workbook: one sheet per table of the report. */
   async function build(data) {
     const X = await loadLib();
     const wb = new X.Workbook();
     wb.creator = data.meta.company; wb.created = new Date();
-    wb.title = data.noContents ? data.reports[0].reportTitle : data.reports.length === 1 ? data.reports[0].title : 'Sales reports';
-    const used = {}, nameList = [];
-    const cs = (data.reports.length > 1 && !data.noContents) ? wb.addWorksheet('Contents', { properties: { tabColor: { argb: 'FFE07B00' } } }) : null;
-    if (cs) used.contents = 1;
-    data.reports.forEach(function (rp) { nameList.push(addReportSheet(wb, rp, data.meta, used)); });
-    if (cs) fillContents(cs, data, nameList);
+    wb.title = data.reports[0].reportTitle || data.reports[0].title;
+    const used = {};
+    data.reports.forEach(function (rp) { addReportSheet(wb, rp, data.meta, used); });
     return wb;
   }
 
@@ -3152,7 +3155,7 @@ li.pk-row.sel { background: var(--brand-t); }
 </script>
   <script>
 /* ---- js/pages-reports.js ---- */
-/* Reports: pick a report, set the period, read it on screen, download it as Excel. */
+/* Reports: Visit Summary Report and Customer Visit Analysis Report. Read on screen, download as Excel. */
 (function () {
   'use strict';
   const SV = window.SV = window.SV || {};
@@ -3160,11 +3163,11 @@ li.pk-row.sel { background: var(--brand-t); }
   SV.pages = SV.pages || {};
 
   const SHOW = 300;
-  const WRAP = { InAddress: 1, OutAddress: 1, Remarks: 1, Issues: 1, Note: 1, Address: 1, Location: 1, Purpose: 1 };
+  const WRAP = { InAddress: 1, OutAddress: 1, Remarks: 1, Address: 1, Location: 1, Purpose: 1 };
   const STATUSES = ['Completed', 'In progress', 'Planned', 'Missed', 'Cancelled'];
   const BADGE = { 'Completed': 'b-active', 'In progress': 'b-planned', 'Planned': 'b-planned', 'Missed': 'b-flag', 'Cancelled': 'b-mute', 'No punch-in': 'b-flag' };
   function dur(m) { m = Math.round(Number(m)); return m >= 60 ? Math.floor(m / 60) + ' h ' + pad(m % 60) + ' min' : m + ' min'; }
-  const FLAGS = { 'Over-claimed': 1, 'No GPS trail': 1, 'Late': 1, 'Missed punch-out': 1, 'Never visited': 1, 'Not visited': 1, 'Checked in, never checked out': 1 };
+  const FLAGS = { 'Missed punch-out': 1 };
 
   function pad(n) { return (n < 10 ? '0' : '') + n; }
   function presets(today) {
@@ -3208,24 +3211,21 @@ li.pk-row.sel { background: var(--brand-t); }
       } catch (e) { root.innerHTML = SV.empty({ icon: 'alert', title: 'Could not load reports', text: e.message }); return; }
 
       const byId = {}; cat.reports.forEach(function (r) { byId[r.id] = r; });
-      const st = { id: byId[q.r] ? q.r : 'visitSummary', sec: '', customer: '', status: '', preset: 'month', from: P.month.from, to: P.month.to, owner: '', days: cat.defaults.days, minMin: cat.defaults.minMin, maxMin: cat.defaults.maxMin,
-        cur: null, meta: null, shown: SHOW, seq: 0, claimUser: '', claimDate: today };
+      const st = { id: byId[q.r] ? q.r : 'visitSummary', sec: '', customer: '', status: '', preset: 'month', from: P.month.from, to: P.month.to, owner: '',
+        cur: null, meta: null, shown: SHOW, seq: 0 };
       const groups = []; cat.reports.forEach(function (r) { let g = groups.find(function (x) { return x.name === r.group; }); if (!g) groups.push(g = { name: r.group, items: [] }); g.items.push(r); });
       const company = SV.state.settings.CompanyName;
 
       root.innerHTML =
-        '<div class="page-head"><div><h1>Reports</h1><p class="page-sub" id="rp-sub"></p></div><div class="head-actions">' +
-        '<button class="btn btn-primary" data-act="all" id="rp-all">' + icon('download') + 'Download all (Excel)</button></div></div>' +
+        '<div class="page-head"><div><h1>Reports</h1><p class="page-sub" id="rp-sub"></p></div></div>' +
         '<div class="toolbar wrap rp-filters">' +
-        '<label class="mini">Period<select class="input" id="rp-preset">' + Object.keys(P).map(function (k) { return '<option value="' + k + '">' + esc(P[k].label) + '</option>'; }).join('') + '<option value="custom">Custom dates</option></select></label>' +
-        '<label class="mini">From<input class="input" type="date" id="rp-from" value="' + st.from + '" max="' + today + '"></label>' +
-        '<label class="mini">To<input class="input" type="date" id="rp-to" value="' + st.to + '"></label>' +
+        '<label class="mini rp-d">Period<select class="input" id="rp-preset">' + Object.keys(P).map(function (k) { return '<option value="' + k + '">' + esc(P[k].label) + '</option>'; }).join('') + '<option value="custom">Custom dates</option></select></label>' +
+        '<label class="mini rp-d">From<input class="input" type="date" id="rp-from" value="' + st.from + '" max="' + today + '"></label>' +
+        '<label class="mini rp-d">To<input class="input" type="date" id="rp-to" value="' + st.to + '"></label>' +
         (admin ? '<label class="mini">Salesperson<select class="input" id="rp-owner"><option value="">All salespeople</option>' + users.map(function (u) { return '<option value="' + esc(u.UserID) + '">' + esc(u.FullName) + (u.Active ? '' : ' (inactive)') + '</option>'; }).join('') + '</select></label>' : '') +
         '<label class="mini rp-p" data-p="customer" hidden>Customer<input class="input" type="text" id="rp-cust" list="rp-cust-list" placeholder="All customers" autocomplete="off"><datalist id="rp-cust-list">' + custs.map(function (c) { return '<option value="' + esc(c.label) + '">'; }).join('') + '</datalist></label>' +
         '<label class="mini rp-p" data-p="status" hidden>Visit status<select class="input" id="rp-status"><option value="">All statuses</option>' + STATUSES.map(function (x) { return '<option>' + x + '</option>'; }).join('') + '</select></label>' +
-        '<label class="mini rp-p" data-p="days" hidden>Not visited for (days)<input class="input" type="number" id="rp-days" min="1" max="365" value="' + st.days + '"></label>' +
-        '<label class="mini rp-p" data-p="minMin" hidden>Short visit under (min)<input class="input" type="number" id="rp-min" min="1" max="120" value="' + st.minMin + '"></label>' +
-        '<label class="mini rp-p" data-p="maxMin" hidden>Long visit over (min)<input class="input" type="number" id="rp-max" min="30" max="1440" value="' + st.maxMin + '"></label></div>' +
+        '</div>' +
         '<div class="rp-grid"><nav class="rp-nav" id="rp-nav" aria-label="Reports"></nav><section class="rp-body">' +
         '<label class="mini rp-pick">Report<select class="input" id="rp-pick">' + groups.map(function (g) { return '<optgroup label="' + esc(g.name) + '">' + g.items.map(function (r) { return '<option value="' + r.id + '">' + esc(r.title) + '</option>'; }).join('') + '</optgroup>'; }).join('') + '</select></label>' +
         '<div id="rp-out">' + SV.skeleton(5) + '</div></section></div>';
@@ -3240,10 +3240,11 @@ li.pk-row.sel { background: var(--brand-t); }
         $('rp-pick').value = st.id;
         const ps = byId[st.id].params;
         root.querySelectorAll('.rp-p').forEach(function (el) { el.hidden = ps.indexOf(el.dataset.p) === -1; });
+        root.querySelectorAll('.rp-d').forEach(function (el) { el.hidden = byId[st.id].dates === false; });
       };
 
       const params = function () {
-        const p = { from: st.from, to: st.to, days: st.days, minMin: st.minMin, maxMin: st.maxMin };
+        const p = byId[st.id].dates === false ? {} : { from: st.from, to: st.to };
         if (admin && st.owner) p.userId = st.owner;
         if (st.customer && byId[st.id].params.indexOf('customer') !== -1) p.customer = st.customer;
         if (st.status && byId[st.id].params.indexOf('status') !== -1) p.status = st.status;
@@ -3253,7 +3254,7 @@ li.pk-row.sel { background: var(--brand-t); }
       const tableHtml = function (rp) {
         const cols = rp.columns.map(function (c, i) {
           const num = c.t === 'int' || c.t === 'dec' || c.t === 'pct' || c.t === 'dur';
-          return { label: esc(c.l), cls: (i === 0 ? 'col-main ' : '') + (num ? 'num' : '') + (WRAP[c.k] ? 'wrap' : ''), mobileLabel: i === 0 ? '' : c.l, render: function (r) { const v = ((r.__tot || (st.id === 'attSheet' && i > 0)) && (r[c.k] === undefined || r[c.k] === null || r[c.k] === '')) ? '' : fmt(c, r[c.k]); return i === 0 ? '<strong>' + v + '</strong>' : v; } };
+          return { label: esc(c.l), cls: (i === 0 ? 'col-main ' : '') + (num ? 'num' : '') + (WRAP[c.k] ? 'wrap' : ''), mobileLabel: i === 0 ? '' : c.l, render: function (r) { const v = (r.__tot && (r[c.k] === undefined || r[c.k] === null || r[c.k] === '')) ? '' : (c.k === 'LastVisit' && !r[c.k]) ? '<span class="badge b-flag">Never visited</span>' : fmt(c, r[c.k]); return i === 0 ? '<strong>' + v + '</strong>' : v; } };
         });
         const rows = rp.rows.slice(0, st.shown);
         if (rp.totals && rp.rows.length) {
@@ -3261,41 +3262,23 @@ li.pk-row.sel { background: var(--brand-t); }
           if (t[k0] === undefined || t[k0] === null || t[k0] === '') t[k0] = 'Total';
           rows.push(t);
         }
-        return SV.table({ cols: cols, rows: rows, cls: 'compact rp-table' + (st.id === 'attSheet' ? ' keep' : ''), rowAttrs: function (r) { return r.__tot ? 'class="tot"' : ''; } }) +
+        return SV.table({ cols: cols, rows: rows, cls: 'compact rp-table', rowAttrs: function (r) { return r.__tot ? 'class="tot"' : ''; } }) +
           (rp.rows.length > st.shown ? '<div class="more"><button class="btn btn-ghost" data-act="more">Show more (' + (rp.rows.length - st.shown) + ' hidden)</button></div>' : '');
-      };
-
-      const claimForm = function () {
-        return '<form class="panel rp-claim" id="km-form" novalidate><h3 class="panel-h">Record kilometres claimed</h3><div class="rp-claim-grid">' +
-          (admin ? '<label class="mini">Salesperson<select class="input" id="kc-user" required><option value="">Choose</option>' + users.filter(function (u) { return u.Active; }).map(function (u) { return '<option value="' + esc(u.UserID) + '" data-name="' + esc(u.FullName) + '"' + (u.UserID === st.claimUser ? ' selected' : '') + '>' + esc(u.FullName) + '</option>'; }).join('') + '</select></label>' : '') +
-          '<label class="mini">Date<input class="input" type="date" id="kc-date" value="' + st.claimDate + '" max="' + today + '" required></label>' +
-          '<label class="mini">Km claimed<input class="input" type="number" id="kc-km" min="0" max="2000" step="0.1" inputmode="decimal" placeholder="e.g. 48.5" required></label>' +
-          '<label class="mini rp-claim-note">Note (optional)<input class="input" type="text" id="kc-note" maxlength="200" placeholder="Route or reason"></label>' +
-          '<button type="submit" class="btn btn-primary" id="kc-go">Save claim</button></div><p class="field-err" id="kc-err" hidden></p>' +
-          '<p class="small muted">One claim per person per day. Saving again for the same day replaces it.</p></form>';
-      };
-      const prefillClaim = function () {
-        const d = $('kc-date'); if (!d || !st.cur) return;
-        const sel = $('kc-user'), name = sel && sel.selectedOptions[0] ? sel.selectedOptions[0].dataset.name : SV.state.user.FullName;
-        const row = st.cur.rows.find(function (r) { return r.Date === d.value && r.Salesperson === name; });
-        $('kc-km').value = row && row.Claimed != null ? row.Claimed : ''; $('kc-note').value = row ? (row.Note || '') : '';
       };
 
       const out = $('rp-out');
       const draw = function () {
         const rp = st.cur, def = byId[st.id], secs = rp.sections || null, sec = secs ? (secs.find(function (x) { return x.id === st.sec; }) || secs[0]) : rp, tab = secs ? sec.id : '';
         if (secs) st.sec = sec.id;
-        $('rp-sub').textContent = SV.fmtDate(st.from) + ' to ' + SV.fmtDate(st.to) + (st.meta ? ', ' + st.meta.who : '');
+        $('rp-sub').textContent = (def.dates === false ? 'As on ' + SV.fmtDate(today) : SV.fmtDate(st.from) + ' to ' + SV.fmtDate(st.to)) + (st.meta ? ', ' + st.meta.who : '');
         out.innerHTML =
           '<div class="rp-head"><div><h2>' + esc(def.title) + '</h2><p class="muted">' + esc(def.description) + '</p></div>' +
           '<button class="btn btn-ghost" data-act="one" id="rp-one">' + icon('download') + 'Excel</button></div>' +
-          (st.id === 'km' ? claimForm() : '') +
           (secs ? '<div class="rp-tabs" role="tablist" aria-label="Report sections">' + secs.map(function (x) { return '<button type="button" role="tab" class="pk-tab' + (x.id === tab ? ' on' : '') + '" aria-selected="' + (x.id === tab) + '" data-act="sec" data-id="' + x.id + '">' + esc(x.title) + ' <span>' + x.rows.length + '</span></button>'; }).join('') + '</div>' : '') +
           (st.meta && st.meta.filters && st.meta.filters.length ? '<p class="small rp-active">Filtered by ' + esc(st.meta.filters.join(', ')) + '</p>' : '') +
           (sec.rows.length ? '<p class="small muted rp-count">' + sec.rows.length + (sec.rows.length === 1 ? ' row' : ' rows') + (sec.truncated ? ' shown of ' + sec.truncated : '') + '</p>' + tableHtml(sec) :
-            SV.empty({ icon: 'list', title: 'No data for these filters', text: 'Widen the dates or clear the salesperson, customer or status filter.' })) +
+            SV.empty({ icon: 'list', title: 'No data for these filters', text: def.dates === false ? 'There are no leads or accounts for this salesperson yet.' : 'Widen the dates or clear the salesperson, customer or status filter.' })) +
           ((sec.notes && sec.notes.length) ? '<ul class="rp-notes">' + sec.notes.map(function (n) { return '<li>' + esc(n) + '</li>'; }).join('') + '</ul>' : '');
-        if (st.id === 'km') prefillClaim();
       };
 
       const load = async function () {
@@ -3313,7 +3296,7 @@ li.pk-row.sel { background: var(--brand-t); }
       };
       const apply = SV.debounce(load, 300);
 
-      const filename = function (name) { return slug(company) + '_' + name + '_' + st.from + '_to_' + st.to + '.xlsx'; };
+      const filename = function (name) { return slug(company) + '_' + name + '_' + (byId[st.id].dates === false ? 'as_on_' + today : st.from + '_to_' + st.to) + '.xlsx'; };
       const download = async function (btn, getData, name) {
         SV.busy(btn, true, 'Preparing');
         try { const data = await getData(); await SV.xlsx.download(data, filename(name)); SV.ok('Excel file downloaded.'); }
@@ -3339,36 +3322,12 @@ li.pk-row.sel { background: var(--brand-t); }
       });
       $('rp-status').addEventListener('change', function (e) { st.status = e.target.value; apply(); });
       const ow = $('rp-owner'); if (ow) ow.addEventListener('change', function () { st.owner = ow.value; apply(); });
-      const num = function (id, key, lo, hi) {
-        $(id).addEventListener('change', function (e) {
-          const n = Math.round(Number(e.target.value)); st[key] = isFinite(n) ? Math.min(hi, Math.max(lo, n)) : cat.defaults[key] || st[key]; e.target.value = st[key]; apply();
-        });
-      };
-      num('rp-days', 'days', 1, 365); num('rp-min', 'minMin', 1, 120); num('rp-max', 'maxMin', 30, 1440);
       $('rp-pick').addEventListener('change', function (e) { select(e.target.value); });
 
       const select = function (id) {
         if (!byId[id]) return;
         st.id = id; st.sec = ''; history.replaceState(null, '', '#/reports?r=' + id); drawNav(); load();
       };
-
-      out.addEventListener('submit', async function (e) {
-        if (e.target.id !== 'km-form') return;
-        e.preventDefault();
-        const err = $('kc-err'), body = { Date: $('kc-date').value, ClaimedKm: $('kc-km').value, Note: $('kc-note').value };
-        if (admin) body.UserID = $('kc-user').value;
-        const bad = (admin && !body.UserID) ? 'Choose a salesperson.' : !body.Date ? 'Choose the date.' : (body.ClaimedKm === '' || Number(body.ClaimedKm) < 0 || Number(body.ClaimedKm) > 2000) ? 'Enter kilometres between 0 and 2000.' : '';
-        err.hidden = !bad; err.textContent = bad;
-        if (bad) return;
-        const btn = $('kc-go'); SV.busy(btn, true, 'Saving');
-        try { await SV.api('kmClaimSave', body); SV.ok('Claim saved.'); await load(); }
-        catch (er) { SV.fail(er); SV.busy(btn, false); }
-      });
-      out.addEventListener('change', function (e) {
-        if (e.target.id === 'kc-date') st.claimDate = e.target.value || today;
-        if (e.target.id === 'kc-user') st.claimUser = e.target.value;
-        if (e.target.id === 'kc-date' || e.target.id === 'kc-user') prefillClaim();
-      });
 
       SV.bind(root, {
         pick: function (d) { select(d.id); },
@@ -3377,16 +3336,9 @@ li.pk-row.sel { background: var(--brand-t); }
         one: function (d, el) {
           if (!st.cur) return;
           const cur = st.cur, data = cur.sections
-            ? { meta: st.meta, noContents: true, reports: cur.sections.map(function (x) { return Object.assign({ id: cur.id + '.' + x.id, reportTitle: cur.title, group: cur.group, description: cur.description }, x); }) }
+            ? { meta: st.meta, reports: cur.sections.map(function (x) { return Object.assign({ id: cur.id + '.' + x.id, reportTitle: cur.title, group: cur.group, description: cur.description }, x); }) }
             : { meta: st.meta, reports: [cur] };
           download(el, async function () { return data; }, slug(cur.title.replace(/[^A-Za-z0-9 ]/g, ' ')) || 'Report');
-        },
-        all: function (d, el) {
-          download(el, async function () {
-            const r = await SV.api('reportAll', params());
-            if (!r.reports.length) throw new Error('No reports could be created for these dates.');
-            return r;
-          }, 'Reports');
         }
       });
 
@@ -3493,7 +3445,7 @@ li.pk-row.sel { background: var(--brand-t); }
       body.innerHTML = html;
       if (admin) {
         const mk = d.todayCheckins.filter(function (l) { return l.CheckInLat != null; }).map(function (l) {
-          const cl = l.CheckInFlag === 'FAR' ? 'flag' : l.CheckInFlag === 'OK' ? 'done' : 'mute';
+          const cl = SV.flagColor(l.CheckInFlag);
           return { lat: l.CheckInLat, lng: l.CheckInLng, title: l.CustomerName, color: SV.maps.COLORS[cl], info: '<div class="iw"><strong>' + esc(l.CustomerName) + '</strong><br>' + esc(l.UserName) + ', ' + esc(SV.fmtTime(l.CheckInTime)) + '<br>' + esc(SV.fmtDistance(l.CheckInDistanceM)) + ' from customer</div>' };
         });
         const m = body.querySelector('#db-map');
